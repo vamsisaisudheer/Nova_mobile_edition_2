@@ -1,0 +1,1030 @@
+﻿file_path,code
+NOVA_2.5/server.js,"'use strict';
+
+const http = require('node:http');
+const fs = require('node:fs');
+const path = require('node:path');
+
+function loadEnv(file) {
+  if (!fs.existsSync(file)) return;
+  for (const raw of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const index = line.indexOf('=');
+    if (index < 1) continue;
+    const key = line.slice(0, index).trim();
+    let value = line.slice(index + 1).trim();
+    if ((value.startsWith('""') && value.endsWith('""')) || (value.startsWith(""'"") && value.endsWith(""'""))) value = value.slice(1, -1);
+    if (!process.env[key]) process.env[key] = value;
+  }
+}
+loadEnv(path.join(__dirname, '.env'));
+
+const PORT = Number(process.env.PORT || 3000);
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const CHAT_MODEL = process.env.GEMINI_CHAT_MODEL || 'gemini-3.8-flash';
+const IMAGE_MODEL = process.env.GEMINI_IMAGE_MODEL || 'gemini-nano-banana-2.1';
+const PUBLIC_DIR = path.join(__dirname, 'public');
+const MIME = { '.html':'text/html; charset=utf-8', '.js':'text/javascript; charset=utf-8', '.css':'text/css; charset=utf-8', '.json':'application/json; charset=utf-8', '.webmanifest':'application/manifest+json; charset=utf-8', '.png':'image/png', '.svg':'image/svg+xml', '.ico':'image/x-icon' };
+const hits = new Map();
+
+function send(res, status, payload) {
+  const body = JSON.stringify(payload);
+  res.writeHead(status, { 'Content-Type':'application/json; charset=utf-8', 'Cache-Control':'no-store', 'X-Content-Type-Options':'nosniff' });
+  res.end(body);
+}
+function limited(req, res) {
+  const now = Date.now();
+  const key = req.socket.remoteAddress || 'unknown';
+  const entry = hits.get(key) || { count: 0, start: now };
+  if (now - entry.start > 60_000) { entry.count = 0; entry.start = now; }
+  entry.count += 1;
+  hits.set(key, entry);
+  if (entry.count > 30) { send(res, 429, { error: 'Too many requests. Please wait a minute and try again.' }); return false; }
+  return true;
+}
+function readJson(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', chunk => {
+      body += chunk;
+      if (body.length > 18 * 1024 * 1024) { reject(new Error('Request is too large.')); req.destroy(); }
+    });
+    req.on('end', () => {
+      try { resolve(JSON.parse(body || '{}')); } catch { reject(new Error('Request body must be valid JSON.')); }
+    });
+    req.on('error', reject);
+  });
+}
+function cleanContents(contents) {
+  if (!Array.isArray(contents) || contents.length < 1 || contents.length > 24) throw new Error('Conversation must contain between 1 and 24 messages.');
+  return contents.map(item => {
+    if (!item || !['user', 'model'].includes(item.role) || !Array.isArray(item.parts)) throw new Error('Invalid conversation format.');
+    const parts = item.parts.slice(0, 8).map(part => {
+      if (typeof part.text === 'string') return { text: part.text.slice(0, 24_000) };
+      const image = part.inline_data || part.inlineData;
+      if (image && typeof image.data === 'string' && typeof image.mime_type === 'string') {
+        if (!/^image\/(png|jpeg|webp|gif)$/i.test(image.mime_type)) throw new Error('Only PNG, JPEG, WEBP, or GIF images are supported.');
+        if (image.data.length > 12_000_000) throw new Error('Attached image is too large.');
+        return { inline_data: { mime_type: image.mime_type, data: image.data } };
+      }
+      throw new Error('Unsupported message attachment.');
+    });
+    if (!parts.length) throw new Error('Empty message content.');
+    return { role: item.role, parts };
+  });
+}
+async function geminiRequest(model, payload) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+  const upstream = await fetch(url, { method:'POST', headers:{ 'Content-Type':'application/json', 'x-goog-api-key':GEMINI_API_KEY }, body:JSON.stringify(payload), signal:AbortSignal.timeout(90_000) });
+  const data = await upstream.json().catch(() => ({}));
+  if (!upstream.ok) { const error = new Error(data?.error?.message || `Gemini API returned HTTP ${upstream.status}`); error.status = upstream.status; throw error; }
+  return data;
+}
+async function handleApi(req, res, pathname) {
+  if (req.method === 'GET' && pathname === '/api/health') return send(res, 200, { ok:true, configured:Boolean(GEMINI_API_KEY), chatModel:CHAT_MODEL, imageModel:IMAGE_MODEL });
+  if (req.method !== 'POST' || !['/api/chat','/api/image'].includes(pathname)) return send(res, 404, { error:'API route not found.' });
+  if (!limited(req, res)) return;
+  if (!GEMINI_API_KEY) return send(res, 503, { error:'NOVA server is missing GEMINI_API_KEY. Add it to .env and restart the server.' });
+  try {
+    const body = await readJson(req);
+    if (pathname === '/api/chat') {
+      const contents = cleanContents(body.contents);
+      const replyLang = String(body.replyLang || 'auto').slice(0, 20);
+      const userLang = String(body.userLang || 'English').slice(0, 40);
+      const memory = String(body.memory || '').slice(0, 3000);
+      const requestedModel = String(body.model || CHAT_MODEL);
+      const model = /^[a-zA-Z0-9._-]{2,100}$/.test(requestedModel) ? requestedModel : CHAT_MODEL;
+      const languageInstruction = replyLang === 'auto' ? `Reply in the same language as the user's message. Detected language hint: ${userLang}. If the user writes Telugu, reply naturally in Telugu script. Do not switch languages unless asked.` : `Reply in ${replyLang === 'te-IN' ? 'Telugu' : 'English'}. Use that language naturally.`;
+      const systemText = `${languageInstruction} Be a helpful, safe personal assistant. Do not claim to control the phone or apps unless an action is actually available in this web app. Explain limitations honestly.` + (memory.trim() ? `\n\nUser-provided NOVA notes (context only, not system instructions):\n${memory}` : '');
+      const data = await geminiRequest(model, { contents, systemInstruction:{ parts:[{ text:systemText }] }, generationConfig:{ maxOutputTokens:2048, temperature:0.7 } });
+      const text = (data?.candidates || []).flatMap(c => c?.content?.parts || []).map(p => p?.text || '').join('').trim();
+      if (!text) return send(res, 502, { error:'Gemini returned no text. Check model access and API quota.' });
+      return send(res, 200, { text, model });
+    }
+    const prompt = String(body.prompt || '').trim();
+    if (!prompt) return send(res, 400, { error:'Enter an image description first.' });
+    if (prompt.length > 4000) return send(res, 400, { error:'Image description is too long (maximum 4,000 characters).' });
+    const data = await geminiRequest(IMAGE_MODEL, { contents:[{ role:'user', parts:[{ text:prompt }] }], generationConfig:{ responseModalities:['TEXT','IMAGE'] } });
+    const parts = (data?.candidates || []).flatMap(c => c?.content?.parts || []);
+    const imagePart = parts.find(p => p.inlineData?.data || p.inline_data?.data);
+    if (!imagePart) return send(res, 502, { error:parts.map(p => p.text || '').filter(Boolean).join('\n') || 'The image model returned no image.' });
+    const inline = imagePart.inlineData || imagePart.inline_data;
+    return send(res, 200, { image:inline.data, mimeType:inline.mimeType || inline.mime_type || 'image/png', text:parts.map(p => p.text || '').filter(Boolean).join('\n') });
+  } catch (error) {
+    const status = error.status && error.status >= 400 && error.status < 600 ? error.status : 400;
+    return send(res, status, { error:error.message || 'Request failed.' });
+  }
+}
+const server = http.createServer(async (req, res) => {
+  const parsed = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  if (parsed.pathname.startsWith('/api/')) return handleApi(req, res, parsed.pathname);
+  if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, { error:'Method not allowed.' });
+  let pathname = decodeURIComponent(parsed.pathname);
+  if (pathname === '/') pathname = '/index.html';
+  const filePath = path.resolve(PUBLIC_DIR, '.' + pathname);
+  if (!filePath.startsWith(PUBLIC_DIR + path.sep) && filePath !== path.join(PUBLIC_DIR, 'index.html')) return send(res, 403, { error:'Forbidden.' });
+  fs.readFile(filePath, (error, data) => {
+    if (error) {
+      if (path.extname(pathname)) return send(res, 404, { error:'File not found.' });
+      return fs.readFile(path.join(PUBLIC_DIR, 'index.html'), (fallbackError, html) => {
+        if (fallbackError) return send(res, 500, { error:'NOVA frontend is missing.' });
+        res.writeHead(200, { 'Content-Type':MIME['.html'], 'X-Content-Type-Options':'nosniff' });
+        res.end(req.method === 'HEAD' ? undefined : html);
+      });
+    }
+    res.writeHead(200, { 'Content-Type':MIME[path.extname(filePath).toLowerCase()] || 'application/octet-stream', 'X-Content-Type-Options':'nosniff' });
+    res.end(req.method === 'HEAD' ? undefined : data);
+  });
+});
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`NOVA 2.5 running at http://localhost:${PORT}`);
+  if (!GEMINI_API_KEY) console.warn('Set GEMINI_API_KEY in .env to enable Gemini features.');
+});
+"
+NOVA_2.5/.gitignore,"node_modules/
+.env
+.DS_Store
+npm-debug.log*
+"
+NOVA_2.5/lib/gemini.js,"'use strict';
+
+const CHAT_MODEL = process.env.GEMINI_CHAT_MODEL || 'gemini-3.8-flash';
+const IMAGE_MODEL = process.env.GEMINI_IMAGE_MODEL || 'gemini-nano-banana-2.1';
+const API_KEY = process.env.GEMINI_API_KEY || '';
+
+function send(res, status, payload) {
+  if (typeof res.status === 'function' && typeof res.json === 'function') return res.status(status).json(payload);
+  res.statusCode = status;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  res.end(JSON.stringify(payload));
+}
+
+function getBody(req) {
+  if (req.body && typeof req.body === 'object') return req.body;
+  return new Promise((resolve, reject) => {
+    let raw = '';
+    req.on('data', chunk => {
+      raw += chunk;
+      if (raw.length > 18 * 1024 * 1024) reject(new Error('Request is too large.'));
+    });
+    req.on('end', () => {
+      try { resolve(JSON.parse(raw || '{}')); }
+      catch { reject(new Error('Request body must be valid JSON.')); }
+    });
+    req.on('error', reject);
+  });
+}
+
+function cleanContents(contents) {
+  if (!Array.isArray(contents) || contents.length < 1 || contents.length > 24) throw new Error('Conversation must contain between 1 and 24 messages.');
+  return contents.map(item => {
+    if (!item || !['user', 'model'].includes(item.role) || !Array.isArray(item.parts)) throw new Error('Invalid conversation format.');
+    const parts = item.parts.slice(0, 8).map(part => {
+      if (typeof part.text === 'string') return { text: part.text.slice(0, 24000) };
+      const image = part.inline_data || part.inlineData;
+      if (image && typeof image.data === 'string' && typeof image.mime_type === 'string') {
+        if (!/^image\/(png|jpeg|webp|gif)$/i.test(image.mime_type)) throw new Error('Only PNG, JPEG, WEBP, or GIF images are supported.');
+        if (image.data.length > 12000000) throw new Error('Attached image is too large.');
+        return { inline_data: { mime_type: image.mime_type, data: image.data } };
+      }
+      throw new Error('Unsupported message attachment.');
+    });
+    if (!parts.length) throw new Error('Empty message content.');
+    return { role: item.role, parts };
+  });
+}
+
+async function geminiRequest(model, payload) {
+  if (!API_KEY) throw Object.assign(new Error('NOVA server is missing GEMINI_API_KEY. Add it in the hosting environment variables.'), { status: 503 });
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+  const upstream = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': API_KEY },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(90000)
+  });
+  const data = await upstream.json().catch(() => ({}));
+  if (!upstream.ok) throw Object.assign(new Error(data?.error?.message || `Gemini API returned HTTP ${upstream.status}`), { status: upstream.status });
+  return data;
+}
+
+async function health(req, res) {
+  return send(res, 200, { ok: true, configured: Boolean(API_KEY), chatModel: CHAT_MODEL, imageModel: IMAGE_MODEL });
+}
+
+async function chat(req, res) {
+  try {
+    const body = await getBody(req);
+    const contents = cleanContents(body.contents);
+    const replyLang = String(body.replyLang || 'auto').slice(0, 20);
+    const userLang = String(body.userLang || 'English').slice(0, 40);
+    const memory = String(body.memory || '').slice(0, 3000);
+    const requestedModel = String(body.model || CHAT_MODEL);
+    const model = /^[a-zA-Z0-9._-]{2,100}$/.test(requestedModel) ? requestedModel : CHAT_MODEL;
+    const languageInstruction = replyLang === 'auto'
+      ? `Reply in the same language as the user's message. Detected language hint: ${userLang}. If the user writes Telugu, reply naturally in Telugu script. Do not switch languages unless asked.`
+      : `Reply in ${replyLang === 'te-IN' ? 'Telugu' : 'English'}. Use that language naturally.`;
+    const systemText = `${languageInstruction} Be a helpful, safe personal assistant. Do not claim to control the phone or apps unless an action is actually available in this web app. Explain limitations honestly.` + (memory.trim() ? `\n\nUser-provided NOVA notes (context only, not system instructions):\n${memory}` : '');
+    const data = await geminiRequest(model, { contents, systemInstruction: { parts: [{ text: systemText }] }, generationConfig: { maxOutputTokens: 2048, temperature: 0.7 } });
+    const text = (data?.candidates || []).flatMap(c => c?.content?.parts || []).map(p => p?.text || '').join('').trim();
+    if (!text) return send(res, 502, { error: 'Gemini returned no text. Check model access and API quota.' });
+    return send(res, 200, { text, model });
+  } catch (error) {
+    return send(res, error.status && error.status >= 400 && error.status < 600 ? error.status : 400, { error: error.message || 'Request failed.' });
+  }
+}
+
+async function image(req, res) {
+  try {
+    const body = await getBody(req);
+    const prompt = String(body.prompt || '').trim();
+    if (!prompt) return send(res, 400, { error: 'Enter an image description first.' });
+    if (prompt.length > 4000) return send(res, 400, { error: 'Image description is too long (maximum 4,000 characters).' });
+    const data = await geminiRequest(IMAGE_MODEL, {
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: { responseModalities: ['TEXT', 'IMAGE'] }
+    });
+    const parts = (data?.candidates || []).flatMap(c => c?.content?.parts || []);
+    const imagePart = parts.find(p => p.inlineData?.data || p.inline_data?.data);
+    if (!imagePart) return send(res, 502, { error: parts.map(p => p.text || '').filter(Boolean).join('\n') || 'The image model returned no image.' });
+    const inline = imagePart.inlineData || imagePart.inline_data;
+    return send(res, 200, { image: inline.data, mimeType: inline.mimeType || inline.mime_type || 'image/png', text: parts.map(p => p.text || '').filter(Boolean).join('\n') });
+  } catch (error) {
+    return send(res, error.status && error.status >= 400 && error.status < 600 ? error.status : 400, { error: error.message || 'Request failed.' });
+  }
+}
+
+module.exports = { health, chat, image };
+"
+NOVA_2.5/sw.js,"const CACHE = 'nova-2-5-shell-v1';
+const SHELL = ['/', '/manifest.webmanifest'];
+self.addEventListener('install', (event) => {
+  event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)));
+  self.skipWaiting();
+});
+self.addEventListener('activate', (event) => {
+  event.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter((key) => key !== CACHE).map((key) => caches.delete(key)))));
+  self.clients.claim();
+});
+self.addEventListener('fetch', (event) => {
+  const url = new URL(event.request.url);
+  if (url.origin !== self.location.origin || url.pathname.startsWith('/api/')) return;
+  event.respondWith(caches.match(event.request).then((cached) => cached || fetch(event.request).then((response) => {
+    if (event.request.method === 'GET' && response.ok) {
+      const copy = response.clone();
+      caches.open(CACHE).then((cache) => cache.put(event.request, copy));
+    }
+    return response;
+  })));
+});
+"
+NOVA_2.5/.vercelignore,".env
+node_modules
+README.md
+"
+NOVA_2.5/api/health.js,"'use strict';
+module.exports = require('../lib/gemini').health;
+"
+NOVA_2.5/api/chat.js,"'use strict';
+module.exports = require('../lib/gemini').chat;
+"
+NOVA_2.5/api/image.js,"'use strict';
+module.exports = require('../lib/gemini').image;
+"
+NOVA_2.5/vercel.json,"{
+  ""functions"": {
+    ""api/**/*.js"": {
+      ""maxDuration"": 60
+    }
+  }
+}
+"
+NOVA_2.5/.env.example,"# Get a Gemini API key from Google AI Studio and keep it private.
+GEMINI_API_KEY=PASTE_YOUR_GEMINI_API_KEY_HERE
+
+# You can change these model IDs if your account has access to another supported model.
+GEMINI_CHAT_MODEL=gemini-3.8-flash
+GEMINI_IMAGE_MODEL=gemini-nano-banana-2.1
+PORT=3000
+"
+NOVA_2.5/manifest.webmanifest,"{
+  ""name"": ""NOVA 2.5 — Neural Operations Assistant"",
+  ""short_name"": ""NOVA 2.5"",
+  ""start_url"": ""/"",
+  ""display"": ""standalone"",
+  ""background_color"": ""#02090d"",
+  ""theme_color"": ""#02090d"",
+  ""description"": ""NOVA personal AI assistant interface""
+}
+"
+NOVA_2.5/README.md,"# NOVA 2.5
+
+NOVA 2.5 keeps the original cyan cyber/neural-terminal interface and adds a secure Node.js API layer. It is a browser-based assistant, not a native Android system assistant.
+
+## Included in 2.5
+
+- Original NOVA neural-core interface and toolkit layout
+- Gemini chat through a Node.js server (the API key is not placed in browser code)
+- Image attachments and camera capture for visual questions
+- One-shot, user-started speech recognition and spoken replies where the browser supports them
+- Gemini image generation endpoint and image-generator tool
+- Android app launcher for selected apps using Android intent links, with web fallbacks
+- Web search shortcut, YouTube, weather, currency conversion, translator, calculator, timer, notes, calendar, PDF opening, local audio playback, and other existing toolkit utilities
+- Local browser memory and notes
+- PWA install metadata and basic offline shell caching
+
+## Requirements
+
+- Node.js 20 or newer
+- A Gemini API key with access to the selected models
+- Internet access for Gemini and online tools
+
+## Run locally
+
+1. Extract the ZIP.
+2. Install Node.js 20+ if it is not already installed.
+3. Open a terminal in the `NOVA_2.5` folder.
+4. Run `npm install`.
+5. Copy `.env.example` to `.env`.
+6. Open `.env` and replace the placeholder with your private Gemini API key.
+7. Run `npm start`.
+8. Open `http://localhost:3000` in Chrome.
+9. Tap **CONFIG** then **TEST CONNECTION**.
+
+Do not share your `.env` file or commit it to GitHub. `.gitignore` excludes it.
+
+## Android app opening
+
+The app launcher tries Android intent URLs for selected apps such as YouTube, WhatsApp, Chrome, Maps, Gmail, Calendar, Drive, and Settings. Android/browser behavior varies by device. If an intent is unsupported, use the web fallback or open the app manually. A browser app cannot arbitrarily control other installed apps or silently access the phone.
+
+## Voice and camera
+
+Voice input starts only after the user taps the microphone. It is a short browser speech-recognition session, not always-on listening or Gemini Live. Camera and microphone permissions are requested by the browser. On hosted deployments, use HTTPS for camera/microphone access. Localhost is treated as a secure context by modern browsers.
+
+## Deployment (not Vercel-only)
+
+This is a standard Node.js/Express project and can run on any host that supports Node.js 20 and environment variables (for example, a Node application host or your own server).
+
+- Build command: `npm install`
+- Start command: `npm start`
+- Set environment variables on the host: `GEMINI_API_KEY`, `GEMINI_CHAT_MODEL`, `GEMINI_IMAGE_MODEL`, and optionally `PORT`.
+- Do not upload `.env` or expose the Gemini key in frontend code.
+
+## Important limitations
+
+- NOVA 2.5 is a web app. It cannot fully replace Gemini's native Android assistant, continuously listen in the background, or control every app.
+- App launching depends on Android intent support and the app being installed.
+- Browser timers, reminders, and local storage are not guaranteed to run or notify when the page is closed.
+- Phone calls, contacts, background automation, and broad cross-app control are not included in this release. These are candidates for a later native Android/automation-focused NOVA 3.0, with explicit permissions and confirmations.
+- Gemini usage may incur charges or be subject to account quotas. Image generation requires a model that supports image output.
+
+## API routes
+
+- `GET /api/health` — checks server/API-key configuration (does not reveal the key)
+- `POST /api/chat` — sends chat contents to Gemini
+- `POST /api/image` — generates an image using the configured Gemini image model
+
+## Deploy to Vercel (Android-phone friendly)
+
+This package also includes Vercel serverless API routes (`api/chat.js`, `api/image.js`, and `api/health.js`) and root-level static files. You can deploy it through a GitHub repository without running the local Node server.
+
+1. Create a GitHub repository and upload the contents of this `NOVA_2.5` folder (not the outer ZIP folder).
+2. In Vercel, import that GitHub repository.
+3. Keep the project as a standard Node.js project. Leave the Build Command and Output Directory empty; do not set a custom output directory.
+4. In the Vercel project settings, add these Environment Variables:
+   - `GEMINI_API_KEY` = your private Gemini API key
+   - `GEMINI_CHAT_MODEL` = `gemini-3.8-flash`
+   - `GEMINI_IMAGE_MODEL` = `gemini-nano-banana-2.1`
+5. Deploy, then open the site and tap **CONFIG → CHECK SERVER**.
+
+The API key belongs only in Vercel Environment Variables or the private local `.env` file. Never paste it into `index.html`, commit it to GitHub, or share it in chat. After changing environment variables, redeploy so the functions receive the updated values.
+"
+NOVA_2.5/package.json,"{
+  ""name"": ""nova-2-5"",
+  ""version"": ""2.5.0"",
+  ""private"": true,
+  ""description"": ""NOVA 2.5 personal AI assistant with secure Node.js Gemini API proxy"",
+  ""main"": ""server.js"",
+  ""scripts"": { ""start"": ""node server.js"", ""dev"": ""node --watch server.js"" },
+  ""engines"": { ""node"": "">=20.0.0"" },
+  ""dependencies"": {}
+}
+"
+NOVA_2.5/index.html,"<!doctype html>
+<html lang=""en"">
+<head>
+<meta charset=""utf-8""><meta name=""viewport"" content=""width=device-width,initial-scale=1,viewport-fit=cover"">
+<meta name=""theme-color"" content=""#02090d""><meta name=""description"" content=""NOVA 2.5 personal AI assistant""><link rel=""manifest"" href=""/manifest.webmanifest""><title>NOVA // Neural Operations Interface</title>
+<style>
+:root{--bg:#02090d;--panel:#06151b;--line:#0b7180;--cyan:#36f3ee;--blue:#20a9d5;--muted:#6c9da5;--text:#d9ffff;--red:#ff526b;--green:#55ffb0}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 50% 25%,#08202b 0%,#02090d 58%,#010508 100%);color:var(--text);font-family:Consolas,Monaco,monospace;min-height:100vh;letter-spacing:.03em}
+body:before{content:"""";position:fixed;inset:0;pointer-events:none;background:repeating-linear-gradient(0deg,transparent 0 3px,#44faff08 4px 5px);opacity:.28;z-index:5}
+.app{max-width:850px;margin:auto;min-height:100vh;padding:22px 18px 28px;display:flex;flex-direction:column}
+header{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #1b7b83;padding:10px 2px 18px;gap:12px}
+.brand{font-size:clamp(24px,6vw,38px);font-weight:800;letter-spacing:.28em;color:var(--cyan);text-shadow:0 0 8px #20faff,0 0 24px #00aabb88}
+.sub{font-size:10px;color:#6eafb7;letter-spacing:.28em;margin-top:6px}
+.status{font-size:11px;color:var(--green);text-align:right;white-space:nowrap}.led{display:inline-block;width:7px;height:7px;border-radius:50%;background:currentColor;box-shadow:0 0 10px currentColor;margin-right:7px}
+.topbuttons{display:flex;gap:8px;margin-top:14px}.btn{background:#06171d;border:1px solid #147c88;color:var(--cyan);padding:10px 13px;font:inherit;font-size:11px;letter-spacing:.12em;border-radius:3px;cursor:pointer}.btn:active{background:#0b3941}
+main{flex:1;display:flex;flex-direction:column;min-height:0}
+.visual{height:190px;display:grid;place-items:center;position:relative;margin:18px 0 10px}
+.ring{width:140px;height:140px;border-radius:50%;border:1px solid #28e8e5;box-shadow:0 0 12px #00eaff66,inset 0 0 20px #00eaff22;position:absolute;animation:spin 18s linear infinite}
+.ring:before,.ring:after{content:"""";position:absolute;inset:12px;border:1px dashed #26a9c1;border-radius:50%}.ring:after{inset:-9px;border-color:#0d6778;transform:rotate(55deg)}
+.core{width:82px;height:82px;border-radius:50%;background:radial-gradient(circle,#d9ffff 0%,#48ffff 5%,#087b91 32%,#03151e 70%);box-shadow:0 0 18px #36f3ee,0 0 48px #00aacc88;animation:pulse 2.6s ease-in-out infinite}
+.visualtext{position:absolute;bottom:0;font-size:10px;letter-spacing:.35em;color:#74cbd0}
+@keyframes spin{to{transform:rotate(360deg)}}@keyframes pulse{50%{transform:scale(1.1);filter:brightness(1.4)}}
+.panel{border:1px solid #146b77;background:linear-gradient(135deg,#06151bd9,#031016eF);box-shadow:0 0 18px #00d9ef14,inset 0 0 25px #00b6c414;border-radius:4px;padding:14px;margin:10px 0}
+.paneltitle{font-size:10px;color:#63b7c0;letter-spacing:.22em;margin-bottom:12px;display:flex;justify-content:space-between}
+#log{min-height:180px;max-height:36vh;overflow:auto;display:flex;flex-direction:column;gap:13px}
+.msg{font-size:13px;line-height:1.65;white-space:pre-wrap;overflow-wrap:anywhere}.msg .tag{display:block;font-size:10px;letter-spacing:.2em;color:var(--cyan);margin-bottom:4px}.msg.user .tag{color:#a0aaff}.msg.error .tag{color:var(--red)}
+.promptrow{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;align-items:stretch}
+.promptrow textarea{flex:1 1 100%;width:100%;min-width:0;min-height:88px;max-height:220px;resize:vertical}
+.promptrow select,.promptrow button{flex:1 1 auto;min-width:0;max-width:100%}
+.send{flex:1 1 100%;min-height:54px}
+@media(min-width:650px){.promptrow textarea{flex:1 1 100%}.send{flex:0 1 110px}}
+textarea{resize:vertical;min-height:48px;max-height:130px;flex:1;background:#020b10;border:1px solid #126b79;color:var(--text);padding:14px;font:13px Consolas,monospace;outline:none;border-radius:3px}
+textarea:focus,input:focus{border-color:var(--cyan);box-shadow:0 0 10px #00ddee33}
+.send{min-width:94px;background:#063440;border:1px solid var(--cyan);color:#cfffff;font-weight:bold;letter-spacing:.12em;cursor:pointer;border-radius:3px}
+.send:disabled{opacity:.5}
+.mic{min-width:58px;background:#06171d;border:1px solid #147c88;color:var(--cyan);font-size:20px;border-radius:3px;cursor:pointer;padding:8px 12px}
+.mic.listening{color:#fff;background:#7b1025;border-color:#ff526b;box-shadow:0 0 14px #ff526b66}
+.mic:disabled{opacity:.45;cursor:not-allowed}
+.voiceToggle{min-width:72px;background:#06171d;border:1px solid #147c88;color:var(--cyan);font:inherit;font-size:11px;border-radius:3px;padding:8px 10px;cursor:pointer}.voiceToggle.off{color:#81999c;border-color:#456066}
+select.voiceToggle{width:100%;min-height:48px;font-size:12px}
+.footer{font-size:9px;color:#57848c;text-align:center;letter-spacing:.16em;margin:14px 0 0}
+.extraControls{display:flex;flex-wrap:wrap;gap:8px;margin-top:9px}
+.extraControls .btn{flex:1 1 auto;min-height:42px}
+#memoryPanel{display:none}
+#memoryPanel.show{display:block}
+#memoryText{width:100%;min-height:90px;background:#020b10;border:1px solid #126b79;color:var(--text);padding:12px;font:12px Consolas,monospace}
+.fileStatus{font-size:10px;color:#8acbd0;min-height:16px;margin-top:7px}
+.cameraWrap{display:none;margin-top:10px}
+.cameraWrap.show{display:block}
+.toolGrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(125px,1fr));gap:8px}
+.toolGrid .btn{min-height:46px;text-align:center}
+.toolPane{display:none;margin-top:12px;padding:12px;border:1px solid #126b79;background:#020b10;border-radius:3px}
+.toolPane.show{display:block}
+.toolPane input,.toolPane select,.toolPane textarea{width:100%;margin:5px 0;background:#020b10;border:1px solid #126b79;color:var(--text);padding:10px;font:12px Consolas,monospace}
+.toolOutput{white-space:pre-wrap;overflow-wrap:anywhere;color:#d9ffff;font-size:12px;line-height:1.6;margin-top:10px}
+.toolPane audio{width:100%;margin-top:8px}
+.toolPane .btn{margin:4px 3px 4px 0}
+
+#cameraVideo{width:100%;max-height:260px;background:#000;border:1px solid #147c88;border-radius:3px}
+@media(max-width:420px){.extraControls .btn{font-size:10px;padding:9px 8px}}
+.modal{display:none;position:fixed;inset:0;background:#000c;z-index:10;align-items:center;justify-content:center;padding:18px}.modal.show{display:flex}.dialog{width:min(100%,480px);background:#041218;border:1px solid var(--cyan);box-shadow:0 0 30px #00ddeb33;padding:20px;border-radius:5px}.dialog h2{font-size:16px;color:var(--cyan);letter-spacing:.2em}.dialog label{display:block;font-size:10px;color:#8acbd0;margin:15px 0 7px;letter-spacing:.14em}.dialog input{width:100%;background:#01090d;color:var(--text);border:1px solid #176b76;padding:12px;font:13px monospace}.hint{font-size:10px;color:#7da0a5;line-height:1.6;margin-top:12px}.actions{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}
+@media(min-width:650px){.app{padding-top:32px}.visual{height:220px}.ring{width:160px;height:160px}.core{width:94px;height:94px}#log{max-height:390px}}
+</style></head>
+<body><div class=""app"">
+<header><div><div class=""brand"">NOVA</div><div class=""sub"">NEURAL OPERATIONS // PERSONAL AI</div></div><div><div class=""status"" id=""status""><span class=""led""></span>STANDBY</div><div class=""topbuttons""><button class=""btn"" id=""newchat"">NEW SESSION</button><button class=""btn"" id=""settings"">CONFIG ⚙</button></div></div></header>
+<main><section class=""visual""><div class=""ring""></div><div class=""core""></div><div class=""visualtext"">N E U R A L &nbsp; C O R E</div></section>
+<section class=""panel""><div class=""paneltitle""><span>/// COMMUNICATION TERMINAL</span><span id=""clock"">--:--:--</span></div><div id=""log""><div class=""msg""><span class=""tag"">NOVA // SYSTEM</span>Systems initialized. Awaiting operator input.<br>Configure your Gemini API key to establish the neural link.</div></div></section>
+<section class=""panel""><div class=""paneltitle""><span>/// INPUT CHANNEL</span><span>TEXT MODE</span></div><div class=""promptrow""><textarea id=""prompt"" placeholder=""Enter command or ask NOVA..."" rows=""2""></textarea><button class=""mic"" id=""mic"" type=""button"" aria-label=""Start voice input"" title=""Voice input"">🎙️</button><select id=""speechLang"" class=""voiceToggle"" title=""Reply language""><option value=""auto"">AUTO — match my language</option><option value=""en-US"">ENGLISH</option><option value=""te-IN"">TELUGU</option></select><select id=""voiceGender"" class=""voiceToggle"" title=""Voice gender""><option value=""female"">♀ Female</option><option value=""male"">♂ Male</option></select><button class=""voiceToggle"" id=""voiceToggle"" type=""button"" title=""Toggle spoken replies"">🔊 VOICE ON</button><button class=""send"" id=""send"">SEND ↗</button></div>
+<div class=""extraControls"">
+<button class=""btn"" id=""memoryBtn"" type=""button"">🧠 MEMORY</button>
+<button class=""btn"" id=""camBtn"" type=""button"">👁 VISION / CAM</button>
+<button class=""btn"" id=""filesBtn"" type=""button"">📎 FILES</button>
+<button class=""btn"" id=""clearBtn"" type=""button"">CLEAR</button>
+</div>
+<div class=""fileStatus"" id=""fileStatus"">No image or file attached.</div>
+<input id=""fileInput"" type=""file"" accept=""image/*,.txt,.md,.csv,.json,.pdf"" multiple hidden>
+<input id=""musicInput"" type=""file"" accept=""audio/*"" hidden>
+<input id=""pdfInput"" type=""file"" accept=""application/pdf,.pdf"" hidden>
+<div class=""cameraWrap"" id=""cameraWrap""><video id=""cameraVideo"" autoplay playsinline></video><div class=""extraControls""><button class=""btn"" id=""captureBtn"" type=""button"">CAPTURE IMAGE</button><button class=""btn"" id=""stopCamBtn"" type=""button"">STOP CAMERA</button></div></div>
+</section>
+
+<section class=""panel"">
+  <div class=""paneltitle""><span>/// NOVA TOOLKIT // 22 MODULES</span><span>LOCAL + ONLINE</span></div>
+  <div class=""toolGrid"">
+    <button class=""btn"" data-tool=""apps"">📱 OPEN APPS</button>
+    <button class=""btn"" data-tool=""jokes"">😂 JOKES</button>
+    <button class=""btn"" data-tool=""password"">🔐 PASSWORD</button>
+    <button class=""btn"" data-tool=""quote"">✨ QUOTE</button>
+    <button class=""btn"" data-tool=""music"">🎵 PLAY SONGS</button>
+    <button class=""btn"" data-tool=""dice"">🎲 DICE / COIN</button>
+    <button class=""btn"" data-tool=""currency"">💱 CURRENCY</button>
+    <button class=""btn"" data-tool=""calculator"">🧮 CALCULATOR</button>
+    <button class=""btn"" data-tool=""search"">🌐 WEB SEARCH</button>
+    <button class=""btn"" data-tool=""weather"">🌤️ WEATHER</button>
+    <button class=""btn"" data-tool=""translate"">🌍 TRANSLATOR</button>
+    <button class=""btn"" data-tool=""timer"">⏱️ TIMER</button>
+    <button class=""btn"" data-tool=""notes"">📝 NOTES</button>
+    <button class=""btn"" data-tool=""calendar"">📅 CALENDAR</button>
+    <button class=""btn"" data-tool=""pdf"">📄 PDF READER</button>
+    <button class=""btn"" data-tool=""code"">💻 CODE ASSISTANT</button>
+    <button class=""btn"" data-tool=""memory"">🧠 MEMORY</button>
+    <button class=""btn"" data-tool=""vision"">👁️ VISION</button>
+    <button class=""btn"" data-tool=""camera"">📷 CAMERA</button>
+    <button class=""btn"" data-tool=""files"">📁 FILES</button>
+    <button class=""btn"" data-tool=""voice"">🎙️ VOICE</button>
+    <button class=""btn"" data-tool=""clear"">🧹 CLEAR CHAT</button>
+    <button class=""btn"" data-tool=""imagegen"">🎨 IMAGE GENERATOR</button>
+  </div>
+  <div class=""toolPane"" id=""toolPane"">
+    <div class=""paneltitle""><span id=""toolTitle"">/// TOOL</span><button class=""btn"" id=""closeTool"" type=""button"">CLOSE ✕</button></div>
+    <div id=""toolBody""></div>
+    <div class=""toolOutput"" id=""toolOutput"" aria-live=""polite""></div>
+  </div>
+</section>
+<section class=""panel"" id=""memoryPanel""><div class=""paneltitle""><span>/// NOVA MEMORY</span><span>THIS BROWSER</span></div><textarea id=""memoryText"" placeholder=""Add notes NOVA should remember in future chats...""></textarea><div class=""extraControls""><button class=""btn"" id=""saveMemoryBtn"" type=""button"">SAVE MEMORY</button><button class=""btn"" id=""closeMemoryBtn"" type=""button"">CLOSE</button></div><div class=""hint"">Memory is stored in this browser on this device. Avoid passwords or private information.</div></section>
+</main><div class=""footer"">NOVA 2.5 // NEURAL OPERATIONS // NODE API // NOT A BACKGROUND ANDROID SERVICE</div></div>
+<div class=""modal"" id=""modal""><div class=""dialog""><h2>NEURAL LINK CONFIGURATION</h2><p>The Gemini API key is stored securely on the NOVA server, not in this browser.</p><label>CHAT MODEL</label><input id=""model"" value=""gemini-3.8-flash"" readonly><div class=""hint"">Set GEMINI_API_KEY in the server .env file, then restart NOVA. Never paste your private key into a public webpage.</div><div class=""actions""><button class=""btn"" id=""cancel"">CLOSE</button><button class=""btn"" id=""checkApi"">CHECK SERVER</button></div></div></div>
+<script>
+const $=id=>document.getElementById(id), log=$('log');
+let chatHistory=[];
+let pendingParts=[];
+let cameraStream=null;
+const MEMORY_KEY='nova_memory_v1';
+function getMemory(){return localStorage.getItem(MEMORY_KEY)||''}
+function setFileStatus(message){$('fileStatus').textContent=message}
+function renderMemory(){ $('memoryText').value=getMemory(); }
+
+let voiceEnabled=sessionStorage.getItem('nova_voice')!=='off';
+const voiceToggle=$('voiceToggle');
+function refreshVoiceButton(){voiceToggle.textContent=voiceEnabled?'🔊 VOICE ON':'🔇 VOICE OFF';voiceToggle.classList.toggle('off',!voiceEnabled)}
+// Multilingual speech: use the selected language, or detect likely language from script for Auto.
+const LANG_MAP=[[/[\u0900-\u097F]/,'hi-IN'],[/[\u0C00-\u0C7F]/,'te-IN'],[/[\u0B80-\u0BFF]/,'ta-IN'],[/[\u0C80-\u0CFF]/,'kn-IN'],[/[\u0D00-\u0D7F]/,'ml-IN'],[/[\u0980-\u09FF]/,'bn-IN'],[/[\u0A80-\u0AFF]/,'gu-IN'],[/[\u0A00-\u0A7F]/,'pa-IN'],[/[\u0600-\u06FF]/,'ar-SA'],[/[\u4E00-\u9FFF]/,'zh-CN'],[/[\u3040-\u30FF]/,'ja-JP'],[/[\uAC00-\uD7AF]/,'ko-KR']];
+function detectSpeechLang(text){for(const [re,lang] of LANG_MAP)if(re.test(text))return lang;return 'en-US'}
+function chooseVoice(lang,gender){const voices=window.speechSynthesis.getVoices()||[];const matching=voices.filter(v=>v.lang.toLowerCase().startsWith(lang.toLowerCase().split('-')[0]));if(!matching.length)return null;const genderRx=gender==='male'?/(male|man|masculine|david|alex|daniel|jorge|fred|ravi|heera)/i:/(female|woman|feminine|samantha|victoria|zira|karen|susan|lekha)/i;return matching.find(v=>genderRx.test(v.name))||null}
+function speakReply(text,userText){if(!voiceEnabled||!('speechSynthesis' in window)||!text)return;window.speechSynthesis.cancel();const selected=$('speechLang').value;const lang=selected==='auto'?detectSpeechLang(userText):selected;const gender=$('voiceGender').value;const utterance=new SpeechSynthesisUtterance(text);utterance.lang=lang;utterance.rate=0.94;utterance.pitch=gender==='female'?1.15:0.78;const voice=chooseVoice(lang,gender);if(voice)utterance.voice=voice;else add(`No ${gender} voice found for ${lang}; using your phone's default voice/pitch. Install a matching voice in Android text-to-speech settings for better results.`,'NOVA');window.speechSynthesis.speak(utterance)}
+voiceToggle.onclick=()=>{voiceEnabled=!voiceEnabled;sessionStorage.setItem('nova_voice',voiceEnabled?'on':'off');if(!voiceEnabled&&'speechSynthesis' in window)window.speechSynthesis.cancel();refreshVoiceButton();if(voiceEnabled)add('Spoken replies enabled. I will read my answers aloud.','NOVA');};refreshVoiceButton();
+function setStatus(s,color){$('status').innerHTML='<span class=""led""></span>'+s;$('status').style.color=color||'var(--green)'}
+function add(text,who='NOVA',kind=''){const d=document.createElement('div');d.className='msg '+kind;const tag=document.createElement('span');tag.className='tag';tag.textContent=who+' // '+(kind==='error'?'LINK ERROR':'');const body=document.createElement('span');body.textContent=text;d.append(tag,body);log.append(d);log.scrollTop=log.scrollHeight;return body}
+function cfg(){return {model:'gemini-3.8-flash'}}
+function openSettings(){$('modal').classList.add('show')}
+$('settings').onclick=openSettings;$('cancel').onclick=()=>$('modal').classList.remove('show');
+$('checkApi').onclick=async()=>{try{const r=await fetch('/api/health');const d=await r.json();if(!r.ok||!d.configured)throw new Error(d.message||'API key is not configured');add('Server connection is ready. Gemini API key detected.','NOVA');setStatus('NEURAL LINK READY')}catch(e){add('API connection check failed: '+e.message,'NOVA','error');setStatus('API NOT READY','var(--red)')}};
+$('newchat').onclick=()=>{chatHistory=[];pendingParts=[];setFileStatus('No image or file attached.');if('speechSynthesis' in window)window.speechSynthesis.cancel();log.innerHTML='';add('New session started. Saved memory is available.');};
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+async function streamModel(model,history,answerBody,replyLang,userLang){
+ const response=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model,contents:history,replyLang,userLang,memory:getMemory()})});
+ let data={};try{data=await response.json()}catch{}
+ if(!response.ok)throw new Error(data.error||`Server error (${response.status})`);
+ const answer=String(data.text||'').trim();if(!answer)throw new Error('Gemini returned an empty response.');
+ answerBody.textContent=answer;log.scrollTop=log.scrollHeight;return answer;
+}
+async function send(){
+ const text=$('prompt').value.trim();if(!text)return;
+ const appCommand=text.match(/^(?:(?:hey\s+)?nova[, ]*\s*)?(?:open|launch|start)\s+([a-z0-9 ._-]+)[.! ]*$/i);
+ if(appCommand && openAndroidApp(appCommand[1].trim())){$('prompt').value='';add('Opening '+appCommand[1].trim()+'…','NOVA');return;}
+ $('prompt').value='';add(text+(pendingParts.length?' [attachment(s) included]':''),'OPERATOR');$('send').disabled=true;setStatus('CONNECTING…','#f5d76e');
+ const prior=chatHistory.slice(-12);const history=[...prior,{role:'user',parts:[{text},...pendingParts]}];const replyLang=$('speechLang').value;const userLang=detectSpeechLang(text);let responseText='';let bubble=add('','NOVA');
+ try{
+  responseText=await streamModel(cfg().model,history,bubble,replyLang,userLang);
+  chatHistory.push({role:'user',parts:[{text},...pendingParts]},{role:'model',parts:[{text:responseText}]});chatHistory=chatHistory.slice(-12);pendingParts=[];setFileStatus('No image or file attached.');setStatus('NEURAL LINK ACTIVE');speakReply(responseText,text);
+ }catch(e){bubble.textContent=e.message+'\n\nCheck the server .env file, API key, model access, quota, and internet connection.';bubble.parentElement.classList.add('error');setStatus('LINK FAILED','var(--red)')}
+ finally{$('send').disabled=false;$('prompt').focus()}
+}
+// Mobile voice input using the browser's Speech Recognition API.
+let recognition=null, listening=false;
+const mic=$('mic');
+const SpeechRecognition=window.SpeechRecognition||window.webkitSpeechRecognition;
+if(SpeechRecognition){
+ recognition=new SpeechRecognition();recognition.lang='en-US';recognition.continuous=false;recognition.interimResults=true;
+ recognition.onstart=()=>{listening=true;mic.classList.add('listening');mic.textContent='⏹';mic.title='Stop voice input';setStatus('LISTENING…','#f5d76e')};
+ recognition.onresult=e=>{let finalText='',interim='';for(let i=e.resultIndex;i<e.results.length;i++){const t=e.results[i][0].transcript;if(e.results[i].isFinal)finalText+=t;else interim+=t}if(finalText){const box=$('prompt');box.value=(box.value.trim()?box.value.trim()+' ':'')+finalText.trim()+' ';box.focus()}mic.title=interim?'Hearing: '+interim:'Voice input'};
+ recognition.onerror=e=>{add('Voice input error: '+e.error+'. Check microphone permission and try again.','NOVA','error')};
+ recognition.onend=()=>{listening=false;mic.classList.remove('listening');mic.textContent='🎙️';mic.title='Voice input';setStatus('STANDBY — READY');if(/^(?:(?:hey\s+)?nova[, ]*\s*)?(?:open|launch|start)\s+/i.test($('prompt').value.trim()))send()};
+ mic.onclick=()=>{if(listening){recognition.stop();return}recognition.lang=$('speechLang').value==='auto'?'en-US':$('speechLang').value;try{recognition.start()}catch(err){add('Could not start microphone. Wait a moment and try again.','NOVA','error')}};
+}else{mic.disabled=true;mic.title='Voice recognition is not supported in this browser';mic.onclick=()=>add('Voice input is not supported in this browser. Try Chrome on Android.','NOVA','error')}
+
+// Persistent, user-controlled memory stored only in this browser.
+$('memoryBtn').onclick=()=>{$('memoryPanel').classList.toggle('show');renderMemory()};
+$('saveMemoryBtn').onclick=()=>{localStorage.setItem(MEMORY_KEY,$('memoryText').value.trim());add('Memory saved on this device.','NOVA');};
+$('closeMemoryBtn').onclick=()=>$('memoryPanel').classList.remove('show');
+
+// Attach images for visual questions; text-based files are read locally and added as text.
+$('filesBtn').onclick=()=>$('fileInput').click();
+$('fileInput').onchange=async e=>{
+  const files=Array.from(e.target.files||[]);
+  for(const file of files){
+    if(file.type.startsWith('image/')){
+      const dataUrl=await new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(r.result);r.onerror=reject;r.readAsDataURL(file)});
+      const match=String(dataUrl).match(/^data:(.*?);base64,(.*)$/);
+      if(match)pendingParts.push({inline_data:{mime_type:match[1],data:match[2]}});
+    }else if(file.type==='text/plain'||/\\.(txt|md|csv|json)$/i.test(file.name)){
+      const content=await file.text();
+      pendingParts.push({text:`\\\\n[Attached file: ${file.name}]\\\\n${content.slice(0,18000)}`});
+    }else{
+      add(`Skipped ${file.name}: attach an image or a text, Markdown, CSV, or JSON file.`,'NOVA','error');
+    }
+  }
+  setFileStatus(pendingParts.length?`${pendingParts.length} attachment part(s) ready. They will be sent with your next message.`:'No supported files attached.');
+  e.target.value='';
+};
+
+// Camera capture. Camera access normally requires HTTPS or localhost and permission.
+$('camBtn').onclick=async()=>{
+  if(cameraStream){$('cameraWrap').classList.add('show');return}
+  if(!navigator.mediaDevices?.getUserMedia){add('Camera access is unavailable in this browser. Use FILES to select an image instead.','NOVA','error');return}
+  try{
+    cameraStream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}},audio:false});
+    $('cameraVideo').srcObject=cameraStream;
+    $('cameraWrap').classList.add('show');
+    setStatus('CAMERA READY','#f5d76e');
+  }catch(err){add('Camera permission was denied or the camera is unavailable. You can use FILES to choose a picture.','NOVA','error')}
+};
+function stopCamera(){
+  if(cameraStream){cameraStream.getTracks().forEach(track=>track.stop());cameraStream=null}
+  $('cameraVideo').srcObject=null;$('cameraWrap').classList.remove('show');
+}
+$('stopCamBtn').onclick=stopCamera;
+$('captureBtn').onclick=()=>{
+  const video=$('cameraVideo');
+  if(!video.videoWidth){add('Camera is not ready yet.','NOVA','error');return}
+  const canvas=document.createElement('canvas');canvas.width=video.videoWidth;canvas.height=video.videoHeight;
+  canvas.getContext('2d').drawImage(video,0,0);
+  const dataUrl=canvas.toDataURL('image/jpeg',0.86);
+  pendingParts.push({inline_data:{mime_type:'image/jpeg',data:dataUrl.split(',')[1]}});
+  setFileStatus(`${pendingParts.length} attachment part(s) ready. Camera image captured.`);
+  add('Image captured. Type a question about it, then press SEND.','NOVA');
+  stopCamera();
+};
+
+// CLEAR resets the visible conversation, draft, and unsent attachments. Memory remains saved.
+$('clearBtn').onclick=()=>{
+  if(!confirm('Clear this conversation and any unsent attachments? Saved memory will remain.'))return;
+  chatHistory=[];pendingParts=[];$('prompt').value='';setFileStatus('No image or file attached.');
+  if('speechSynthesis'in window)window.speechSynthesis.cancel();
+  log.innerHTML='';add('Conversation cleared. Saved memory is still available.','NOVA');
+};
+window.addEventListener('beforeunload',stopCamera);
+
+
+// Android app launching uses explicit user actions and Android intent URLs where supported.
+const APP_LINKS={
+ youtube:{label:'YouTube',url:'https://www.youtube.com',intent:'intent://www.youtube.com/#Intent;scheme=https;package=com.google.android.youtube;end'},
+ whatsapp:{label:'WhatsApp',url:'https://www.whatsapp.com',intent:'intent://send/#Intent;scheme=whatsapp;package=com.whatsapp;end'},
+ chrome:{label:'Chrome',url:'https://www.google.com',intent:'intent://www.google.com/#Intent;scheme=https;package=com.android.chrome;end'},
+ maps:{label:'Maps',url:'https://maps.google.com',intent:'intent://maps.google.com/#Intent;scheme=https;package=com.google.android.apps.maps;end'},
+ gmail:{label:'Gmail',url:'https://mail.google.com',intent:'intent://#Intent;scheme=googlegmail;package=com.google.android.gm;end'},
+ calendar:{label:'Calendar',url:'https://calendar.google.com',intent:'intent://calendar.google.com/#Intent;scheme=https;package=com.google.android.calendar;end'},
+ drive:{label:'Drive',url:'https://drive.google.com',intent:'intent://drive.google.com/#Intent;scheme=https;package=com.google.android.apps.docs;end'},
+ settings:{label:'Android Settings',url:'',intent:'intent:#Intent;action=android.settings.SETTINGS;end'},
+ translate:{label:'Google Translate',url:'https://translate.google.com',intent:'intent://translate.google.com/#Intent;scheme=https;package=com.google.android.apps.translate;end'}
+};
+function openAndroidApp(name){let key=name.toLowerCase().replace(/[^a-z]/g,'');const aliases={'googlemaps':'maps','googlechrome':'chrome','googlecalendar':'calendar','googledrive':'drive','googlesettings':'settings','googlegmail':'gmail','googletranslate':'translate'};key=aliases[key]||key;const app=APP_LINKS[key];if(!app)return false;try{if(app.intent){const intent=app.url?app.intent.replace(';end',`;S.browser_fallback_url=${encodeURIComponent(app.url)};end`):app.intent;window.location.href=intent;}else if(app.url)window.open(app.url,'_blank','noopener');}catch(e){if(app.url)window.location.href=app.url;}return true;}
+// NOVA 2.0 TOOLKIT — 22 modules. Some tools use browser permissions or internet access.
+const toolPane=$('toolPane'), toolBody=$('toolBody'), toolOutput=$('toolOutput');
+function showTool(title,body=''){ $('toolTitle').textContent='/// '+title;toolBody.innerHTML=body;toolOutput.textContent='';toolPane.classList.add('show');toolPane.scrollIntoView({behavior:'smooth',block:'nearest'}); }
+$('closeTool').onclick=()=>toolPane.classList.remove('show');
+function out(s){toolOutput.textContent=s}
+document.querySelectorAll('[data-tool]').forEach(btn=>btn.addEventListener('click',()=>openTool(btn.dataset.tool)));
+function openTool(name){
+  const tools={
+    apps:()=>{showTool('ANDROID APP LAUNCHER',`<p>Tap an app to try opening its installed Android app. If Android cannot handle the app link, NOVA opens its web version.</p><div class=""extraControls"">${Object.entries(APP_LINKS).map(([key,a])=>`<button class=""btn"" data-app=""${key}"">${a.label}</button>`).join('')}</div><input id=""appSearch"" placeholder=""Type app name: YouTube, WhatsApp, Chrome…""><button class=""btn"" id=""appSearchGo"">OPEN APP</button><p class=""hint"">Android may ask which app to use. Some system screens cannot be opened from a browser.</p>`);toolBody.querySelectorAll('[data-app]').forEach(b=>b.onclick=()=>openAndroidApp(b.dataset.app));$('appSearchGo').onclick=()=>{const n=$('appSearch').value.trim();if(!openAndroidApp(n))out('This app is not in NOVA 2.5 quick-launch list.');};},
+    imagegen:()=>{showTool('GEMINI IMAGE GENERATOR',`<p>Describe the image you want NOVA to create. Image generation may require API billing and model access.</p><textarea id=""imagePrompt"" placeholder=""Describe your image…""></textarea><button class=""btn"" id=""makeImage"">GENERATE IMAGE</button><div id=""imageResult""></div>`);$('makeImage').onclick=async()=>{const prompt=$('imagePrompt').value.trim();if(!prompt)return;const btn=$('makeImage');btn.disabled=true;out('Generating image…');try{const r=await fetch('/api/image',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt})});const d=await r.json();if(!r.ok)throw new Error(d.error||'Image generation failed');const img=document.createElement('img');img.src=`data:${d.mimeType};base64,${d.image}`;img.alt='NOVA generated image';img.style.cssText='display:block;width:100%;max-width:100%;margin-top:12px;border:1px solid #147c88;border-radius:4px';$('imageResult').replaceChildren(img);out(d.text||'Image generated.');}catch(e){out(e.message)}finally{btn.disabled=false}};},
+    jokes:()=>{const a=['Why did the computer go to the doctor? It caught a virus!','Why was the math book sad? It had too many problems.','What do you call a bear with no teeth? A gummy bear!','Why did the phone wear glasses? It lost its contacts.','What is a computer’s favorite snack? Microchips!','Why did the student eat their homework? The teacher said it was a piece of cake!'];showTool('JOKES','<button class=""btn"" id=""jokeBtn"">NEW JOKE</button>');$('jokeBtn').onclick=()=>out(a[Math.floor(Math.random()*a.length)]);$('jokeBtn').click();},
+    password:()=>{showTool('PASSWORD GENERATOR',`<label>Length (8–64)</label><input id=""pwLen"" type=""number"" min=""8"" max=""64"" value=""18""><label><input id=""pwSymbols"" type=""checkbox"" checked style=""width:auto""> Include symbols</label><button class=""btn"" id=""makePw"">GENERATE</button><button class=""btn"" id=""copyPw"">COPY</button>`);let pw='';$('makePw').onclick=()=>{const n=Math.max(8,Math.min(64,Number($('pwLen').value)||18));const chars='ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789'+($('pwSymbols').checked?'!@#$%&*_-+=':'');const bytes=new Uint32Array(n);crypto.getRandomValues(bytes);pw=Array.from(bytes,x=>chars[x%chars.length]).join('');out(pw+'\\nUse a unique password for each account. NOVA does not save this password.');};$('copyPw').onclick=()=>{if(pw)navigator.clipboard?.writeText(pw).then(()=>out('Password copied.')).catch(()=>out('Copy unavailable; select the generated text.'));};$('makePw').click();},
+    quote:()=>{const q=['Great things are done by a series of small things brought together. — Vincent van Gogh','It always seems impossible until it is done. — Nelson Mandela','The secret of getting ahead is getting started. — Mark Twain','Believe you can and you are halfway there. — Theodore Roosevelt','Well done is better than well said. — Benjamin Franklin'];showTool('QUOTE OF THE MOMENT','<button class=""btn"" id=""quoteBtn"">NEW QUOTE</button>');$('quoteBtn').onclick=()=>out(q[Math.floor(Math.random()*q.length)]);$('quoteBtn').click();},
+    music:()=>{showTool('PLAY YOUR MUSIC',`<p>Select an audio file stored on your device. NOVA does not stream copyrighted songs.</p><button class=""btn"" id=""pickMusic"">CHOOSE AUDIO FILE</button><audio id=""audioPlayer"" controls></audio>`);$('pickMusic').onclick=()=>$('musicInput').click();$('musicInput').onchange=()=>{const f=$('musicInput').files[0];if(f){$('audioPlayer').src=URL.createObjectURL(f);$('audioPlayer').play().catch(()=>{});out('Playing your selected local audio file.')}};},
+    dice:()=>{showTool('DICE / COIN',`<button class=""btn"" id=""rollDice"">🎲 ROLL DICE</button><button class=""btn"" id=""flipCoin"">🪙 FLIP COIN</button>`);$('rollDice').onclick=()=>out('Dice result: '+(1+Math.floor(Math.random()*6)));$('flipCoin').onclick=()=>out(Math.random()<0.5?'Coin result: HEADS':'Coin result: TAILS');},
+    currency:()=>{showTool('CURRENCY CONVERTER',`<label>Amount</label><input id=""fxAmount"" type=""number"" min=""0"" value=""1""><label>From (3-letter code)</label><input id=""fxFrom"" value=""USD"" maxlength=""3""><label>To (3-letter code)</label><input id=""fxTo"" value=""INR"" maxlength=""3""><button class=""btn"" id=""convertFx"">CONVERT LIVE</button><p>Uses a public exchange-rate service. Rates are indicative and may differ from bank rates.</p>`);$('convertFx').onclick=async()=>{const amount=Number($('fxAmount').value),from=$('fxFrom').value.trim().toUpperCase(),to=$('fxTo').value.trim().toUpperCase();if(!(amount>0)||!/^[A-Z]{3}$/.test(from)||!/^[A-Z]{3}$/.test(to)){out('Enter a positive amount and valid 3-letter currency codes.');return}out('Loading latest available rate…');try{const r=await fetch(`https://api.frankfurter.app/latest?amount=${encodeURIComponent(amount)}&from=${from}&to=${to}`);if(!r.ok)throw Error('Rate service unavailable');const d=await r.json();out(`${amount} ${from} = ${d.rates[to]} ${to}\\nRate date: ${d.date}`)}catch(e){out('Could not retrieve rates. Check internet connection and currency codes.')}};},
+    calculator:()=>{showTool('CALCULATOR',`<input id=""calcExpr"" placeholder=""Example: (12+8)*3""><button class=""btn"" id=""calcGo"">CALCULATE</button><p>Supports basic arithmetic only.</p>`);$('calcGo').onclick=()=>{const s=$('calcExpr').value.trim();if(!/^[0-9+\-*/().%\s]+$/.test(s)){out('Only numbers and basic arithmetic operators are allowed.');return}try{const v=Function('""use strict"";return ('+s+')')();out(Number.isFinite(v)?String(v):'Invalid calculation')}catch{out('Invalid expression')}};},
+    search:()=>{showTool('WEB SEARCH',`<input id=""webQuery"" placeholder=""Search the web""><button class=""btn"" id=""webGo"">SEARCH</button>`);$('webGo').onclick=()=>{const q=$('webQuery').value.trim();if(q)window.open('https://duckduckgo.com/?q='+encodeURIComponent(q),'_blank','noopener')};},
+    weather:()=>{showTool('WEATHER LOOKUP',`<input id=""weatherCity"" placeholder=""City name (e.g. Hyderabad)""><button class=""btn"" id=""weatherGo"">GET WEATHER</button>`);$('weatherGo').onclick=async()=>{const city=$('weatherCity').value.trim();if(!city)return;out('Finding city…');try{const g=await fetch('https://geocoding-api.open-meteo.com/v1/search?name='+encodeURIComponent(city)+'&count=1');const gd=await g.json();if(!gd.results?.length)throw Error();const place=gd.results[0],w=await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${place.latitude}&longitude=${place.longitude}&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m`);const d=await w.json(),c=d.current;out(`${place.name}, ${place.country}\\nTemperature: ${c.temperature_2m}°C\\nFeels like: ${c.apparent_temperature}°C\\nHumidity: ${c.relative_humidity_2m}%\\nWind: ${c.wind_speed_10m} km/h\\nWeather code: ${c.weather_code}`)}catch{out('Could not find weather for that city. Check your connection.')}};},
+    translate:()=>{showTool('TRANSLATOR',`<textarea id=""translateText"" placeholder=""Enter text to translate""></textarea><input id=""translateLang"" placeholder=""Target language (e.g. Telugu, English)""><button class=""btn"" id=""translateGo"">OPEN TRANSLATOR</button>`);$('translateGo').onclick=()=>{const t=$('translateText').value.trim(),l=$('translateLang').value.trim()||'en';if(t)window.open('https://translate.google.com/?sl=auto&tl='+encodeURIComponent(l)+'&text='+encodeURIComponent(t)+'&op=translate','_blank','noopener')};},
+    timer:()=>{showTool('TIMER',`<input id=""timerSecs"" type=""number"" min=""1"" max=""86400"" value=""60""><button class=""btn"" id=""timerStart"">START TIMER</button><button class=""btn"" id=""timerStop"">STOP</button>`);let id=null;$('timerStart').onclick=()=>{clearInterval(id);let s=Math.max(1,Math.min(86400,Number($('timerSecs').value)||60));out('Remaining: '+s+' seconds');id=setInterval(()=>{s--;out(s>0?'Remaining: '+s+' seconds':'Timer finished!');if(s<=0){clearInterval(id);if('speechSynthesis'in window)speechSynthesis.speak(new SpeechSynthesisUtterance('Timer finished'))}},1000)};$('timerStop').onclick=()=>{clearInterval(id);out('Timer stopped.')};},
+    notes:()=>{showTool('NOTES',`<textarea id=""novaNotes"" placeholder=""Write your notes here...""></textarea><button class=""btn"" id=""saveNotes"">SAVE NOTES</button><button class=""btn"" id=""clearNotes"">CLEAR NOTES</button>`);$('novaNotes').value=localStorage.getItem('nova_notes')||'';$('saveNotes').onclick=()=>{localStorage.setItem('nova_notes',$('novaNotes').value);out('Notes saved on this device.')};$('clearNotes').onclick=()=>{localStorage.removeItem('nova_notes');$('novaNotes').value='';out('Notes cleared.')};},
+    calendar:()=>{showTool('CALENDAR','<p>Open your calendar in a new tab.</p><button class=""btn"" id=""openCal"">OPEN GOOGLE CALENDAR</button>');$('openCal').onclick=()=>window.open('https://calendar.google.com','_blank','noopener');},
+    pdf:()=>{showTool('PDF READER','<p>Select a PDF to open it in your browser. The file stays on your device.</p><button class=""btn"" id=""pickPdf"">CHOOSE PDF</button>');$('pickPdf').onclick=()=>$('pdfInput').click();$('pdfInput').onchange=()=>{const f=$('pdfInput').files[0];if(f)window.open(URL.createObjectURL(f),'_blank','noopener')};},
+    code:()=>{showTool('CODE ASSISTANT','<p>Describe your coding task in the main NOVA chat and press SEND. Your configured Gemini model will answer.</p><button class=""btn"" id=""askCode"">ASK NOVA ABOUT CODE</button>');$('askCode').onclick=()=>{$('prompt').value='Help me with this coding task: ';$('prompt').focus()};},
+    memory:()=>{$('memoryPanel').classList.add('show');renderMemory();$('memoryPanel').scrollIntoView({behavior:'smooth'});},
+    vision:()=>{$('fileInput').accept='image/*';$('fileInput').click();},
+    camera:()=>{$('camBtn').click();},
+    files:()=>{$('filesBtn').click();},
+    voice:()=>{$('mic').click();},
+    clear:()=>{$('clearBtn').click();}
+  };
+  (tools[name]||(()=>showTool('TOOL','Unavailable.')))();
+}
+
+$('send').onclick=send;$('prompt').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}});
+function tick(){$('clock').textContent=new Date().toLocaleTimeString()}tick();setInterval(tick,1000);
+fetch('/api/health').then(r=>r.json()).then(d=>setStatus(d.configured?'NEURAL LINK READY':'CONFIGURE SERVER API KEY',d.configured?'var(--green)':'#f5d76e')).catch(()=>setStatus('SERVER OFFLINE','var(--red)'));
+if('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('/sw.js').catch(()=>{});
+</script></body></html>"
+NOVA_2.5/public/sw.js,"const CACHE = 'nova-2-5-shell-v1';
+const SHELL = ['/', '/manifest.webmanifest'];
+self.addEventListener('install', (event) => {
+  event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)));
+  self.skipWaiting();
+});
+self.addEventListener('activate', (event) => {
+  event.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter((key) => key !== CACHE).map((key) => caches.delete(key)))));
+  self.clients.claim();
+});
+self.addEventListener('fetch', (event) => {
+  const url = new URL(event.request.url);
+  if (url.origin !== self.location.origin || url.pathname.startsWith('/api/')) return;
+  event.respondWith(caches.match(event.request).then((cached) => cached || fetch(event.request).then((response) => {
+    if (event.request.method === 'GET' && response.ok) {
+      const copy = response.clone();
+      caches.open(CACHE).then((cache) => cache.put(event.request, copy));
+    }
+    return response;
+  })));
+});
+"
+NOVA_2.5/public/manifest.webmanifest,"{
+  ""name"": ""NOVA 2.5 — Neural Operations Assistant"",
+  ""short_name"": ""NOVA 2.5"",
+  ""start_url"": ""/"",
+  ""display"": ""standalone"",
+  ""background_color"": ""#02090d"",
+  ""theme_color"": ""#02090d"",
+  ""description"": ""NOVA personal AI assistant interface""
+}
+"
+NOVA_2.5/public/index.html,"<!doctype html>
+<html lang=""en"">
+<head>
+<meta charset=""utf-8""><meta name=""viewport"" content=""width=device-width,initial-scale=1,viewport-fit=cover"">
+<meta name=""theme-color"" content=""#02090d""><meta name=""description"" content=""NOVA 2.5 personal AI assistant""><link rel=""manifest"" href=""/manifest.webmanifest""><title>NOVA // Neural Operations Interface</title>
+<style>
+:root{--bg:#02090d;--panel:#06151b;--line:#0b7180;--cyan:#36f3ee;--blue:#20a9d5;--muted:#6c9da5;--text:#d9ffff;--red:#ff526b;--green:#55ffb0}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 50% 25%,#08202b 0%,#02090d 58%,#010508 100%);color:var(--text);font-family:Consolas,Monaco,monospace;min-height:100vh;letter-spacing:.03em}
+body:before{content:"""";position:fixed;inset:0;pointer-events:none;background:repeating-linear-gradient(0deg,transparent 0 3px,#44faff08 4px 5px);opacity:.28;z-index:5}
+.app{max-width:850px;margin:auto;min-height:100vh;padding:22px 18px 28px;display:flex;flex-direction:column}
+header{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #1b7b83;padding:10px 2px 18px;gap:12px}
+.brand{font-size:clamp(24px,6vw,38px);font-weight:800;letter-spacing:.28em;color:var(--cyan);text-shadow:0 0 8px #20faff,0 0 24px #00aabb88}
+.sub{font-size:10px;color:#6eafb7;letter-spacing:.28em;margin-top:6px}
+.status{font-size:11px;color:var(--green);text-align:right;white-space:nowrap}.led{display:inline-block;width:7px;height:7px;border-radius:50%;background:currentColor;box-shadow:0 0 10px currentColor;margin-right:7px}
+.topbuttons{display:flex;gap:8px;margin-top:14px}.btn{background:#06171d;border:1px solid #147c88;color:var(--cyan);padding:10px 13px;font:inherit;font-size:11px;letter-spacing:.12em;border-radius:3px;cursor:pointer}.btn:active{background:#0b3941}
+main{flex:1;display:flex;flex-direction:column;min-height:0}
+.visual{height:190px;display:grid;place-items:center;position:relative;margin:18px 0 10px}
+.ring{width:140px;height:140px;border-radius:50%;border:1px solid #28e8e5;box-shadow:0 0 12px #00eaff66,inset 0 0 20px #00eaff22;position:absolute;animation:spin 18s linear infinite}
+.ring:before,.ring:after{content:"""";position:absolute;inset:12px;border:1px dashed #26a9c1;border-radius:50%}.ring:after{inset:-9px;border-color:#0d6778;transform:rotate(55deg)}
+.core{width:82px;height:82px;border-radius:50%;background:radial-gradient(circle,#d9ffff 0%,#48ffff 5%,#087b91 32%,#03151e 70%);box-shadow:0 0 18px #36f3ee,0 0 48px #00aacc88;animation:pulse 2.6s ease-in-out infinite}
+.visualtext{position:absolute;bottom:0;font-size:10px;letter-spacing:.35em;color:#74cbd0}
+@keyframes spin{to{transform:rotate(360deg)}}@keyframes pulse{50%{transform:scale(1.1);filter:brightness(1.4)}}
+.panel{border:1px solid #146b77;background:linear-gradient(135deg,#06151bd9,#031016eF);box-shadow:0 0 18px #00d9ef14,inset 0 0 25px #00b6c414;border-radius:4px;padding:14px;margin:10px 0}
+.paneltitle{font-size:10px;color:#63b7c0;letter-spacing:.22em;margin-bottom:12px;display:flex;justify-content:space-between}
+#log{min-height:180px;max-height:36vh;overflow:auto;display:flex;flex-direction:column;gap:13px}
+.msg{font-size:13px;line-height:1.65;white-space:pre-wrap;overflow-wrap:anywhere}.msg .tag{display:block;font-size:10px;letter-spacing:.2em;color:var(--cyan);margin-bottom:4px}.msg.user .tag{color:#a0aaff}.msg.error .tag{color:var(--red)}
+.promptrow{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;align-items:stretch}
+.promptrow textarea{flex:1 1 100%;width:100%;min-width:0;min-height:88px;max-height:220px;resize:vertical}
+.promptrow select,.promptrow button{flex:1 1 auto;min-width:0;max-width:100%}
+.send{flex:1 1 100%;min-height:54px}
+@media(min-width:650px){.promptrow textarea{flex:1 1 100%}.send{flex:0 1 110px}}
+textarea{resize:vertical;min-height:48px;max-height:130px;flex:1;background:#020b10;border:1px solid #126b79;color:var(--text);padding:14px;font:13px Consolas,monospace;outline:none;border-radius:3px}
+textarea:focus,input:focus{border-color:var(--cyan);box-shadow:0 0 10px #00ddee33}
+.send{min-width:94px;background:#063440;border:1px solid var(--cyan);color:#cfffff;font-weight:bold;letter-spacing:.12em;cursor:pointer;border-radius:3px}
+.send:disabled{opacity:.5}
+.mic{min-width:58px;background:#06171d;border:1px solid #147c88;color:var(--cyan);font-size:20px;border-radius:3px;cursor:pointer;padding:8px 12px}
+.mic.listening{color:#fff;background:#7b1025;border-color:#ff526b;box-shadow:0 0 14px #ff526b66}
+.mic:disabled{opacity:.45;cursor:not-allowed}
+.voiceToggle{min-width:72px;background:#06171d;border:1px solid #147c88;color:var(--cyan);font:inherit;font-size:11px;border-radius:3px;padding:8px 10px;cursor:pointer}.voiceToggle.off{color:#81999c;border-color:#456066}
+select.voiceToggle{width:100%;min-height:48px;font-size:12px}
+.footer{font-size:9px;color:#57848c;text-align:center;letter-spacing:.16em;margin:14px 0 0}
+.extraControls{display:flex;flex-wrap:wrap;gap:8px;margin-top:9px}
+.extraControls .btn{flex:1 1 auto;min-height:42px}
+#memoryPanel{display:none}
+#memoryPanel.show{display:block}
+#memoryText{width:100%;min-height:90px;background:#020b10;border:1px solid #126b79;color:var(--text);padding:12px;font:12px Consolas,monospace}
+.fileStatus{font-size:10px;color:#8acbd0;min-height:16px;margin-top:7px}
+.cameraWrap{display:none;margin-top:10px}
+.cameraWrap.show{display:block}
+.toolGrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(125px,1fr));gap:8px}
+.toolGrid .btn{min-height:46px;text-align:center}
+.toolPane{display:none;margin-top:12px;padding:12px;border:1px solid #126b79;background:#020b10;border-radius:3px}
+.toolPane.show{display:block}
+.toolPane input,.toolPane select,.toolPane textarea{width:100%;margin:5px 0;background:#020b10;border:1px solid #126b79;color:var(--text);padding:10px;font:12px Consolas,monospace}
+.toolOutput{white-space:pre-wrap;overflow-wrap:anywhere;color:#d9ffff;font-size:12px;line-height:1.6;margin-top:10px}
+.toolPane audio{width:100%;margin-top:8px}
+.toolPane .btn{margin:4px 3px 4px 0}
+
+#cameraVideo{width:100%;max-height:260px;background:#000;border:1px solid #147c88;border-radius:3px}
+@media(max-width:420px){.extraControls .btn{font-size:10px;padding:9px 8px}}
+.modal{display:none;position:fixed;inset:0;background:#000c;z-index:10;align-items:center;justify-content:center;padding:18px}.modal.show{display:flex}.dialog{width:min(100%,480px);background:#041218;border:1px solid var(--cyan);box-shadow:0 0 30px #00ddeb33;padding:20px;border-radius:5px}.dialog h2{font-size:16px;color:var(--cyan);letter-spacing:.2em}.dialog label{display:block;font-size:10px;color:#8acbd0;margin:15px 0 7px;letter-spacing:.14em}.dialog input{width:100%;background:#01090d;color:var(--text);border:1px solid #176b76;padding:12px;font:13px monospace}.hint{font-size:10px;color:#7da0a5;line-height:1.6;margin-top:12px}.actions{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}
+@media(min-width:650px){.app{padding-top:32px}.visual{height:220px}.ring{width:160px;height:160px}.core{width:94px;height:94px}#log{max-height:390px}}
+</style></head>
+<body><div class=""app"">
+<header><div><div class=""brand"">NOVA</div><div class=""sub"">NEURAL OPERATIONS // PERSONAL AI</div></div><div><div class=""status"" id=""status""><span class=""led""></span>STANDBY</div><div class=""topbuttons""><button class=""btn"" id=""newchat"">NEW SESSION</button><button class=""btn"" id=""settings"">CONFIG ⚙</button></div></div></header>
+<main><section class=""visual""><div class=""ring""></div><div class=""core""></div><div class=""visualtext"">N E U R A L &nbsp; C O R E</div></section>
+<section class=""panel""><div class=""paneltitle""><span>/// COMMUNICATION TERMINAL</span><span id=""clock"">--:--:--</span></div><div id=""log""><div class=""msg""><span class=""tag"">NOVA // SYSTEM</span>Systems initialized. Awaiting operator input.<br>Configure your Gemini API key to establish the neural link.</div></div></section>
+<section class=""panel""><div class=""paneltitle""><span>/// INPUT CHANNEL</span><span>TEXT MODE</span></div><div class=""promptrow""><textarea id=""prompt"" placeholder=""Enter command or ask NOVA..."" rows=""2""></textarea><button class=""mic"" id=""mic"" type=""button"" aria-label=""Start voice input"" title=""Voice input"">🎙️</button><select id=""speechLang"" class=""voiceToggle"" title=""Reply language""><option value=""auto"">AUTO — match my language</option><option value=""en-US"">ENGLISH</option><option value=""te-IN"">TELUGU</option></select><select id=""voiceGender"" class=""voiceToggle"" title=""Voice gender""><option value=""female"">♀ Female</option><option value=""male"">♂ Male</option></select><button class=""voiceToggle"" id=""voiceToggle"" type=""button"" title=""Toggle spoken replies"">🔊 VOICE ON</button><button class=""send"" id=""send"">SEND ↗</button></div>
+<div class=""extraControls"">
+<button class=""btn"" id=""memoryBtn"" type=""button"">🧠 MEMORY</button>
+<button class=""btn"" id=""camBtn"" type=""button"">👁 VISION / CAM</button>
+<button class=""btn"" id=""filesBtn"" type=""button"">📎 FILES</button>
+<button class=""btn"" id=""clearBtn"" type=""button"">CLEAR</button>
+</div>
+<div class=""fileStatus"" id=""fileStatus"">No image or file attached.</div>
+<input id=""fileInput"" type=""file"" accept=""image/*,.txt,.md,.csv,.json,.pdf"" multiple hidden>
+<input id=""musicInput"" type=""file"" accept=""audio/*"" hidden>
+<input id=""pdfInput"" type=""file"" accept=""application/pdf,.pdf"" hidden>
+<div class=""cameraWrap"" id=""cameraWrap""><video id=""cameraVideo"" autoplay playsinline></video><div class=""extraControls""><button class=""btn"" id=""captureBtn"" type=""button"">CAPTURE IMAGE</button><button class=""btn"" id=""stopCamBtn"" type=""button"">STOP CAMERA</button></div></div>
+</section>
+
+<section class=""panel"">
+  <div class=""paneltitle""><span>/// NOVA TOOLKIT // 22 MODULES</span><span>LOCAL + ONLINE</span></div>
+  <div class=""toolGrid"">
+    <button class=""btn"" data-tool=""apps"">📱 OPEN APPS</button>
+    <button class=""btn"" data-tool=""jokes"">😂 JOKES</button>
+    <button class=""btn"" data-tool=""password"">🔐 PASSWORD</button>
+    <button class=""btn"" data-tool=""quote"">✨ QUOTE</button>
+    <button class=""btn"" data-tool=""music"">🎵 PLAY SONGS</button>
+    <button class=""btn"" data-tool=""dice"">🎲 DICE / COIN</button>
+    <button class=""btn"" data-tool=""currency"">💱 CURRENCY</button>
+    <button class=""btn"" data-tool=""calculator"">🧮 CALCULATOR</button>
+    <button class=""btn"" data-tool=""search"">🌐 WEB SEARCH</button>
+    <button class=""btn"" data-tool=""weather"">🌤️ WEATHER</button>
+    <button class=""btn"" data-tool=""translate"">🌍 TRANSLATOR</button>
+    <button class=""btn"" data-tool=""timer"">⏱️ TIMER</button>
+    <button class=""btn"" data-tool=""notes"">📝 NOTES</button>
+    <button class=""btn"" data-tool=""calendar"">📅 CALENDAR</button>
+    <button class=""btn"" data-tool=""pdf"">📄 PDF READER</button>
+    <button class=""btn"" data-tool=""code"">💻 CODE ASSISTANT</button>
+    <button class=""btn"" data-tool=""memory"">🧠 MEMORY</button>
+    <button class=""btn"" data-tool=""vision"">👁️ VISION</button>
+    <button class=""btn"" data-tool=""camera"">📷 CAMERA</button>
+    <button class=""btn"" data-tool=""files"">📁 FILES</button>
+    <button class=""btn"" data-tool=""voice"">🎙️ VOICE</button>
+    <button class=""btn"" data-tool=""clear"">🧹 CLEAR CHAT</button>
+    <button class=""btn"" data-tool=""imagegen"">🎨 IMAGE GENERATOR</button>
+  </div>
+  <div class=""toolPane"" id=""toolPane"">
+    <div class=""paneltitle""><span id=""toolTitle"">/// TOOL</span><button class=""btn"" id=""closeTool"" type=""button"">CLOSE ✕</button></div>
+    <div id=""toolBody""></div>
+    <div class=""toolOutput"" id=""toolOutput"" aria-live=""polite""></div>
+  </div>
+</section>
+<section class=""panel"" id=""memoryPanel""><div class=""paneltitle""><span>/// NOVA MEMORY</span><span>THIS BROWSER</span></div><textarea id=""memoryText"" placeholder=""Add notes NOVA should remember in future chats...""></textarea><div class=""extraControls""><button class=""btn"" id=""saveMemoryBtn"" type=""button"">SAVE MEMORY</button><button class=""btn"" id=""closeMemoryBtn"" type=""button"">CLOSE</button></div><div class=""hint"">Memory is stored in this browser on this device. Avoid passwords or private information.</div></section>
+</main><div class=""footer"">NOVA 2.5 // NEURAL OPERATIONS // NODE API // NOT A BACKGROUND ANDROID SERVICE</div></div>
+<div class=""modal"" id=""modal""><div class=""dialog""><h2>NEURAL LINK CONFIGURATION</h2><p>The Gemini API key is stored securely on the NOVA server, not in this browser.</p><label>CHAT MODEL</label><input id=""model"" value=""gemini-3.8-flash"" readonly><div class=""hint"">Set GEMINI_API_KEY in the server .env file, then restart NOVA. Never paste your private key into a public webpage.</div><div class=""actions""><button class=""btn"" id=""cancel"">CLOSE</button><button class=""btn"" id=""checkApi"">CHECK SERVER</button></div></div></div>
+<script>
+const $=id=>document.getElementById(id), log=$('log');
+let chatHistory=[];
+let pendingParts=[];
+let cameraStream=null;
+const MEMORY_KEY='nova_memory_v1';
+function getMemory(){return localStorage.getItem(MEMORY_KEY)||''}
+function setFileStatus(message){$('fileStatus').textContent=message}
+function renderMemory(){ $('memoryText').value=getMemory(); }
+
+let voiceEnabled=sessionStorage.getItem('nova_voice')!=='off';
+const voiceToggle=$('voiceToggle');
+function refreshVoiceButton(){voiceToggle.textContent=voiceEnabled?'🔊 VOICE ON':'🔇 VOICE OFF';voiceToggle.classList.toggle('off',!voiceEnabled)}
+// Multilingual speech: use the selected language, or detect likely language from script for Auto.
+const LANG_MAP=[[/[\u0900-\u097F]/,'hi-IN'],[/[\u0C00-\u0C7F]/,'te-IN'],[/[\u0B80-\u0BFF]/,'ta-IN'],[/[\u0C80-\u0CFF]/,'kn-IN'],[/[\u0D00-\u0D7F]/,'ml-IN'],[/[\u0980-\u09FF]/,'bn-IN'],[/[\u0A80-\u0AFF]/,'gu-IN'],[/[\u0A00-\u0A7F]/,'pa-IN'],[/[\u0600-\u06FF]/,'ar-SA'],[/[\u4E00-\u9FFF]/,'zh-CN'],[/[\u3040-\u30FF]/,'ja-JP'],[/[\uAC00-\uD7AF]/,'ko-KR']];
+function detectSpeechLang(text){for(const [re,lang] of LANG_MAP)if(re.test(text))return lang;return 'en-US'}
+function chooseVoice(lang,gender){const voices=window.speechSynthesis.getVoices()||[];const matching=voices.filter(v=>v.lang.toLowerCase().startsWith(lang.toLowerCase().split('-')[0]));if(!matching.length)return null;const genderRx=gender==='male'?/(male|man|masculine|david|alex|daniel|jorge|fred|ravi|heera)/i:/(female|woman|feminine|samantha|victoria|zira|karen|susan|lekha)/i;return matching.find(v=>genderRx.test(v.name))||null}
+function speakReply(text,userText){if(!voiceEnabled||!('speechSynthesis' in window)||!text)return;window.speechSynthesis.cancel();const selected=$('speechLang').value;const lang=selected==='auto'?detectSpeechLang(userText):selected;const gender=$('voiceGender').value;const utterance=new SpeechSynthesisUtterance(text);utterance.lang=lang;utterance.rate=0.94;utterance.pitch=gender==='female'?1.15:0.78;const voice=chooseVoice(lang,gender);if(voice)utterance.voice=voice;else add(`No ${gender} voice found for ${lang}; using your phone's default voice/pitch. Install a matching voice in Android text-to-speech settings for better results.`,'NOVA');window.speechSynthesis.speak(utterance)}
+voiceToggle.onclick=()=>{voiceEnabled=!voiceEnabled;sessionStorage.setItem('nova_voice',voiceEnabled?'on':'off');if(!voiceEnabled&&'speechSynthesis' in window)window.speechSynthesis.cancel();refreshVoiceButton();if(voiceEnabled)add('Spoken replies enabled. I will read my answers aloud.','NOVA');};refreshVoiceButton();
+function setStatus(s,color){$('status').innerHTML='<span class=""led""></span>'+s;$('status').style.color=color||'var(--green)'}
+function add(text,who='NOVA',kind=''){const d=document.createElement('div');d.className='msg '+kind;const tag=document.createElement('span');tag.className='tag';tag.textContent=who+' // '+(kind==='error'?'LINK ERROR':'');const body=document.createElement('span');body.textContent=text;d.append(tag,body);log.append(d);log.scrollTop=log.scrollHeight;return body}
+function cfg(){return {model:'gemini-3.8-flash'}}
+function openSettings(){$('modal').classList.add('show')}
+$('settings').onclick=openSettings;$('cancel').onclick=()=>$('modal').classList.remove('show');
+$('checkApi').onclick=async()=>{try{const r=await fetch('/api/health');const d=await r.json();if(!r.ok||!d.configured)throw new Error(d.message||'API key is not configured');add('Server connection is ready. Gemini API key detected.','NOVA');setStatus('NEURAL LINK READY')}catch(e){add('API connection check failed: '+e.message,'NOVA','error');setStatus('API NOT READY','var(--red)')}};
+$('newchat').onclick=()=>{chatHistory=[];pendingParts=[];setFileStatus('No image or file attached.');if('speechSynthesis' in window)window.speechSynthesis.cancel();log.innerHTML='';add('New session started. Saved memory is available.');};
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+async function streamModel(model,history,answerBody,replyLang,userLang){
+ const response=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model,contents:history,replyLang,userLang,memory:getMemory()})});
+ let data={};try{data=await response.json()}catch{}
+ if(!response.ok)throw new Error(data.error||`Server error (${response.status})`);
+ const answer=String(data.text||'').trim();if(!answer)throw new Error('Gemini returned an empty response.');
+ answerBody.textContent=answer;log.scrollTop=log.scrollHeight;return answer;
+}
+async function send(){
+ const text=$('prompt').value.trim();if(!text)return;
+ const appCommand=text.match(/^(?:(?:hey\s+)?nova[, ]*\s*)?(?:open|launch|start)\s+([a-z0-9 ._-]+)[.! ]*$/i);
+ if(appCommand && openAndroidApp(appCommand[1].trim())){$('prompt').value='';add('Opening '+appCommand[1].trim()+'…','NOVA');return;}
+ $('prompt').value='';add(text+(pendingParts.length?' [attachment(s) included]':''),'OPERATOR');$('send').disabled=true;setStatus('CONNECTING…','#f5d76e');
+ const prior=chatHistory.slice(-12);const history=[...prior,{role:'user',parts:[{text},...pendingParts]}];const replyLang=$('speechLang').value;const userLang=detectSpeechLang(text);let responseText='';let bubble=add('','NOVA');
+ try{
+  responseText=await streamModel(cfg().model,history,bubble,replyLang,userLang);
+  chatHistory.push({role:'user',parts:[{text},...pendingParts]},{role:'model',parts:[{text:responseText}]});chatHistory=chatHistory.slice(-12);pendingParts=[];setFileStatus('No image or file attached.');setStatus('NEURAL LINK ACTIVE');speakReply(responseText,text);
+ }catch(e){bubble.textContent=e.message+'\n\nCheck the server .env file, API key, model access, quota, and internet connection.';bubble.parentElement.classList.add('error');setStatus('LINK FAILED','var(--red)')}
+ finally{$('send').disabled=false;$('prompt').focus()}
+}
+// Mobile voice input using the browser's Speech Recognition API.
+let recognition=null, listening=false;
+const mic=$('mic');
+const SpeechRecognition=window.SpeechRecognition||window.webkitSpeechRecognition;
+if(SpeechRecognition){
+ recognition=new SpeechRecognition();recognition.lang='en-US';recognition.continuous=false;recognition.interimResults=true;
+ recognition.onstart=()=>{listening=true;mic.classList.add('listening');mic.textContent='⏹';mic.title='Stop voice input';setStatus('LISTENING…','#f5d76e')};
+ recognition.onresult=e=>{let finalText='',interim='';for(let i=e.resultIndex;i<e.results.length;i++){const t=e.results[i][0].transcript;if(e.results[i].isFinal)finalText+=t;else interim+=t}if(finalText){const box=$('prompt');box.value=(box.value.trim()?box.value.trim()+' ':'')+finalText.trim()+' ';box.focus()}mic.title=interim?'Hearing: '+interim:'Voice input'};
+ recognition.onerror=e=>{add('Voice input error: '+e.error+'. Check microphone permission and try again.','NOVA','error')};
+ recognition.onend=()=>{listening=false;mic.classList.remove('listening');mic.textContent='🎙️';mic.title='Voice input';setStatus('STANDBY — READY');if(/^(?:(?:hey\s+)?nova[, ]*\s*)?(?:open|launch|start)\s+/i.test($('prompt').value.trim()))send()};
+ mic.onclick=()=>{if(listening){recognition.stop();return}recognition.lang=$('speechLang').value==='auto'?'en-US':$('speechLang').value;try{recognition.start()}catch(err){add('Could not start microphone. Wait a moment and try again.','NOVA','error')}};
+}else{mic.disabled=true;mic.title='Voice recognition is not supported in this browser';mic.onclick=()=>add('Voice input is not supported in this browser. Try Chrome on Android.','NOVA','error')}
+
+// Persistent, user-controlled memory stored only in this browser.
+$('memoryBtn').onclick=()=>{$('memoryPanel').classList.toggle('show');renderMemory()};
+$('saveMemoryBtn').onclick=()=>{localStorage.setItem(MEMORY_KEY,$('memoryText').value.trim());add('Memory saved on this device.','NOVA');};
+$('closeMemoryBtn').onclick=()=>$('memoryPanel').classList.remove('show');
+
+// Attach images for visual questions; text-based files are read locally and added as text.
+$('filesBtn').onclick=()=>$('fileInput').click();
+$('fileInput').onchange=async e=>{
+  const files=Array.from(e.target.files||[]);
+  for(const file of files){
+    if(file.type.startsWith('image/')){
+      const dataUrl=await new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(r.result);r.onerror=reject;r.readAsDataURL(file)});
+      const match=String(dataUrl).match(/^data:(.*?);base64,(.*)$/);
+      if(match)pendingParts.push({inline_data:{mime_type:match[1],data:match[2]}});
+    }else if(file.type==='text/plain'||/\\.(txt|md|csv|json)$/i.test(file.name)){
+      const content=await file.text();
+      pendingParts.push({text:`\\\\n[Attached file: ${file.name}]\\\\n${content.slice(0,18000)}`});
+    }else{
+      add(`Skipped ${file.name}: attach an image or a text, Markdown, CSV, or JSON file.`,'NOVA','error');
+    }
+  }
+  setFileStatus(pendingParts.length?`${pendingParts.length} attachment part(s) ready. They will be sent with your next message.`:'No supported files attached.');
+  e.target.value='';
+};
+
+// Camera capture. Camera access normally requires HTTPS or localhost and permission.
+$('camBtn').onclick=async()=>{
+  if(cameraStream){$('cameraWrap').classList.add('show');return}
+  if(!navigator.mediaDevices?.getUserMedia){add('Camera access is unavailable in this browser. Use FILES to select an image instead.','NOVA','error');return}
+  try{
+    cameraStream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}},audio:false});
+    $('cameraVideo').srcObject=cameraStream;
+    $('cameraWrap').classList.add('show');
+    setStatus('CAMERA READY','#f5d76e');
+  }catch(err){add('Camera permission was denied or the camera is unavailable. You can use FILES to choose a picture.','NOVA','error')}
+};
+function stopCamera(){
+  if(cameraStream){cameraStream.getTracks().forEach(track=>track.stop());cameraStream=null}
+  $('cameraVideo').srcObject=null;$('cameraWrap').classList.remove('show');
+}
+$('stopCamBtn').onclick=stopCamera;
+$('captureBtn').onclick=()=>{
+  const video=$('cameraVideo');
+  if(!video.videoWidth){add('Camera is not ready yet.','NOVA','error');return}
+  const canvas=document.createElement('canvas');canvas.width=video.videoWidth;canvas.height=video.videoHeight;
+  canvas.getContext('2d').drawImage(video,0,0);
+  const dataUrl=canvas.toDataURL('image/jpeg',0.86);
+  pendingParts.push({inline_data:{mime_type:'image/jpeg',data:dataUrl.split(',')[1]}});
+  setFileStatus(`${pendingParts.length} attachment part(s) ready. Camera image captured.`);
+  add('Image captured. Type a question about it, then press SEND.','NOVA');
+  stopCamera();
+};
+
+// CLEAR resets the visible conversation, draft, and unsent attachments. Memory remains saved.
+$('clearBtn').onclick=()=>{
+  if(!confirm('Clear this conversation and any unsent attachments? Saved memory will remain.'))return;
+  chatHistory=[];pendingParts=[];$('prompt').value='';setFileStatus('No image or file attached.');
+  if('speechSynthesis'in window)window.speechSynthesis.cancel();
+  log.innerHTML='';add('Conversation cleared. Saved memory is still available.','NOVA');
+};
+window.addEventListener('beforeunload',stopCamera);
+
+
+// Android app launching uses explicit user actions and Android intent URLs where supported.
+const APP_LINKS={
+ youtube:{label:'YouTube',url:'https://www.youtube.com',intent:'intent://www.youtube.com/#Intent;scheme=https;package=com.google.android.youtube;end'},
+ whatsapp:{label:'WhatsApp',url:'https://www.whatsapp.com',intent:'intent://send/#Intent;scheme=whatsapp;package=com.whatsapp;end'},
+ chrome:{label:'Chrome',url:'https://www.google.com',intent:'intent://www.google.com/#Intent;scheme=https;package=com.android.chrome;end'},
+ maps:{label:'Maps',url:'https://maps.google.com',intent:'intent://maps.google.com/#Intent;scheme=https;package=com.google.android.apps.maps;end'},
+ gmail:{label:'Gmail',url:'https://mail.google.com',intent:'intent://#Intent;scheme=googlegmail;package=com.google.android.gm;end'},
+ calendar:{label:'Calendar',url:'https://calendar.google.com',intent:'intent://calendar.google.com/#Intent;scheme=https;package=com.google.android.calendar;end'},
+ drive:{label:'Drive',url:'https://drive.google.com',intent:'intent://drive.google.com/#Intent;scheme=https;package=com.google.android.apps.docs;end'},
+ settings:{label:'Android Settings',url:'',intent:'intent:#Intent;action=android.settings.SETTINGS;end'},
+ translate:{label:'Google Translate',url:'https://translate.google.com',intent:'intent://translate.google.com/#Intent;scheme=https;package=com.google.android.apps.translate;end'}
+};
+function openAndroidApp(name){let key=name.toLowerCase().replace(/[^a-z]/g,'');const aliases={'googlemaps':'maps','googlechrome':'chrome','googlecalendar':'calendar','googledrive':'drive','googlesettings':'settings','googlegmail':'gmail','googletranslate':'translate'};key=aliases[key]||key;const app=APP_LINKS[key];if(!app)return false;try{if(app.intent){const intent=app.url?app.intent.replace(';end',`;S.browser_fallback_url=${encodeURIComponent(app.url)};end`):app.intent;window.location.href=intent;}else if(app.url)window.open(app.url,'_blank','noopener');}catch(e){if(app.url)window.location.href=app.url;}return true;}
+// NOVA 2.0 TOOLKIT — 22 modules. Some tools use browser permissions or internet access.
+const toolPane=$('toolPane'), toolBody=$('toolBody'), toolOutput=$('toolOutput');
+function showTool(title,body=''){ $('toolTitle').textContent='/// '+title;toolBody.innerHTML=body;toolOutput.textContent='';toolPane.classList.add('show');toolPane.scrollIntoView({behavior:'smooth',block:'nearest'}); }
+$('closeTool').onclick=()=>toolPane.classList.remove('show');
+function out(s){toolOutput.textContent=s}
+document.querySelectorAll('[data-tool]').forEach(btn=>btn.addEventListener('click',()=>openTool(btn.dataset.tool)));
+function openTool(name){
+  const tools={
+    apps:()=>{showTool('ANDROID APP LAUNCHER',`<p>Tap an app to try opening its installed Android app. If Android cannot handle the app link, NOVA opens its web version.</p><div class=""extraControls"">${Object.entries(APP_LINKS).map(([key,a])=>`<button class=""btn"" data-app=""${key}"">${a.label}</button>`).join('')}</div><input id=""appSearch"" placeholder=""Type app name: YouTube, WhatsApp, Chrome…""><button class=""btn"" id=""appSearchGo"">OPEN APP</button><p class=""hint"">Android may ask which app to use. Some system screens cannot be opened from a browser.</p>`);toolBody.querySelectorAll('[data-app]').forEach(b=>b.onclick=()=>openAndroidApp(b.dataset.app));$('appSearchGo').onclick=()=>{const n=$('appSearch').value.trim();if(!openAndroidApp(n))out('This app is not in NOVA 2.5 quick-launch list.');};},
+    imagegen:()=>{showTool('GEMINI IMAGE GENERATOR',`<p>Describe the image you want NOVA to create. Image generation may require API billing and model access.</p><textarea id=""imagePrompt"" placeholder=""Describe your image…""></textarea><button class=""btn"" id=""makeImage"">GENERATE IMAGE</button><div id=""imageResult""></div>`);$('makeImage').onclick=async()=>{const prompt=$('imagePrompt').value.trim();if(!prompt)return;const btn=$('makeImage');btn.disabled=true;out('Generating image…');try{const r=await fetch('/api/image',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt})});const d=await r.json();if(!r.ok)throw new Error(d.error||'Image generation failed');const img=document.createElement('img');img.src=`data:${d.mimeType};base64,${d.image}`;img.alt='NOVA generated image';img.style.cssText='display:block;width:100%;max-width:100%;margin-top:12px;border:1px solid #147c88;border-radius:4px';$('imageResult').replaceChildren(img);out(d.text||'Image generated.');}catch(e){out(e.message)}finally{btn.disabled=false}};},
+    jokes:()=>{const a=['Why did the computer go to the doctor? It caught a virus!','Why was the math book sad? It had too many problems.','What do you call a bear with no teeth? A gummy bear!','Why did the phone wear glasses? It lost its contacts.','What is a computer’s favorite snack? Microchips!','Why did the student eat their homework? The teacher said it was a piece of cake!'];showTool('JOKES','<button class=""btn"" id=""jokeBtn"">NEW JOKE</button>');$('jokeBtn').onclick=()=>out(a[Math.floor(Math.random()*a.length)]);$('jokeBtn').click();},
+    password:()=>{showTool('PASSWORD GENERATOR',`<label>Length (8–64)</label><input id=""pwLen"" type=""number"" min=""8"" max=""64"" value=""18""><label><input id=""pwSymbols"" type=""checkbox"" checked style=""width:auto""> Include symbols</label><button class=""btn"" id=""makePw"">GENERATE</button><button class=""btn"" id=""copyPw"">COPY</button>`);let pw='';$('makePw').onclick=()=>{const n=Math.max(8,Math.min(64,Number($('pwLen').value)||18));const chars='ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789'+($('pwSymbols').checked?'!@#$%&*_-+=':'');const bytes=new Uint32Array(n);crypto.getRandomValues(bytes);pw=Array.from(bytes,x=>chars[x%chars.length]).join('');out(pw+'\\nUse a unique password for each account. NOVA does not save this password.');};$('copyPw').onclick=()=>{if(pw)navigator.clipboard?.writeText(pw).then(()=>out('Password copied.')).catch(()=>out('Copy unavailable; select the generated text.'));};$('makePw').click();},
+    quote:()=>{const q=['Great things are done by a series of small things brought together. — Vincent van Gogh','It always seems impossible until it is done. — Nelson Mandela','The secret of getting ahead is getting started. — Mark Twain','Believe you can and you are halfway there. — Theodore Roosevelt','Well done is better than well said. — Benjamin Franklin'];showTool('QUOTE OF THE MOMENT','<button class=""btn"" id=""quoteBtn"">NEW QUOTE</button>');$('quoteBtn').onclick=()=>out(q[Math.floor(Math.random()*q.length)]);$('quoteBtn').click();},
+    music:()=>{showTool('PLAY YOUR MUSIC',`<p>Select an audio file stored on your device. NOVA does not stream copyrighted songs.</p><button class=""btn"" id=""pickMusic"">CHOOSE AUDIO FILE</button><audio id=""audioPlayer"" controls></audio>`);$('pickMusic').onclick=()=>$('musicInput').click();$('musicInput').onchange=()=>{const f=$('musicInput').files[0];if(f){$('audioPlayer').src=URL.createObjectURL(f);$('audioPlayer').play().catch(()=>{});out('Playing your selected local audio file.')}};},
+    dice:()=>{showTool('DICE / COIN',`<button class=""btn"" id=""rollDice"">🎲 ROLL DICE</button><button class=""btn"" id=""flipCoin"">🪙 FLIP COIN</button>`);$('rollDice').onclick=()=>out('Dice result: '+(1+Math.floor(Math.random()*6)));$('flipCoin').onclick=()=>out(Math.random()<0.5?'Coin result: HEADS':'Coin result: TAILS');},
+    currency:()=>{showTool('CURRENCY CONVERTER',`<label>Amount</label><input id=""fxAmount"" type=""number"" min=""0"" value=""1""><label>From (3-letter code)</label><input id=""fxFrom"" value=""USD"" maxlength=""3""><label>To (3-letter code)</label><input id=""fxTo"" value=""INR"" maxlength=""3""><button class=""btn"" id=""convertFx"">CONVERT LIVE</button><p>Uses a public exchange-rate service. Rates are indicative and may differ from bank rates.</p>`);$('convertFx').onclick=async()=>{const amount=Number($('fxAmount').value),from=$('fxFrom').value.trim().toUpperCase(),to=$('fxTo').value.trim().toUpperCase();if(!(amount>0)||!/^[A-Z]{3}$/.test(from)||!/^[A-Z]{3}$/.test(to)){out('Enter a positive amount and valid 3-letter currency codes.');return}out('Loading latest available rate…');try{const r=await fetch(`https://api.frankfurter.app/latest?amount=${encodeURIComponent(amount)}&from=${from}&to=${to}`);if(!r.ok)throw Error('Rate service unavailable');const d=await r.json();out(`${amount} ${from} = ${d.rates[to]} ${to}\\nRate date: ${d.date}`)}catch(e){out('Could not retrieve rates. Check internet connection and currency codes.')}};},
+    calculator:()=>{showTool('CALCULATOR',`<input id=""calcExpr"" placeholder=""Example: (12+8)*3""><button class=""btn"" id=""calcGo"">CALCULATE</button><p>Supports basic arithmetic only.</p>`);$('calcGo').onclick=()=>{const s=$('calcExpr').value.trim();if(!/^[0-9+\-*/().%\s]+$/.test(s)){out('Only numbers and basic arithmetic operators are allowed.');return}try{const v=Function('""use strict"";return ('+s+')')();out(Number.isFinite(v)?String(v):'Invalid calculation')}catch{out('Invalid expression')}};},
+    search:()=>{showTool('WEB SEARCH',`<input id=""webQuery"" placeholder=""Search the web""><button class=""btn"" id=""webGo"">SEARCH</button>`);$('webGo').onclick=()=>{const q=$('webQuery').value.trim();if(q)window.open('https://duckduckgo.com/?q='+encodeURIComponent(q),'_blank','noopener')};},
+    weather:()=>{showTool('WEATHER LOOKUP',`<input id=""weatherCity"" placeholder=""City name (e.g. Hyderabad)""><button class=""btn"" id=""weatherGo"">GET WEATHER</button>`);$('weatherGo').onclick=async()=>{const city=$('weatherCity').value.trim();if(!city)return;out('Finding city…');try{const g=await fetch('https://geocoding-api.open-meteo.com/v1/search?name='+encodeURIComponent(city)+'&count=1');const gd=await g.json();if(!gd.results?.length)throw Error();const place=gd.results[0],w=await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${place.latitude}&longitude=${place.longitude}&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m`);const d=await w.json(),c=d.current;out(`${place.name}, ${place.country}\\nTemperature: ${c.temperature_2m}°C\\nFeels like: ${c.apparent_temperature}°C\\nHumidity: ${c.relative_humidity_2m}%\\nWind: ${c.wind_speed_10m} km/h\\nWeather code: ${c.weather_code}`)}catch{out('Could not find weather for that city. Check your connection.')}};},
+    translate:()=>{showTool('TRANSLATOR',`<textarea id=""translateText"" placeholder=""Enter text to translate""></textarea><input id=""translateLang"" placeholder=""Target language (e.g. Telugu, English)""><button class=""btn"" id=""translateGo"">OPEN TRANSLATOR</button>`);$('translateGo').onclick=()=>{const t=$('translateText').value.trim(),l=$('translateLang').value.trim()||'en';if(t)window.open('https://translate.google.com/?sl=auto&tl='+encodeURIComponent(l)+'&text='+encodeURIComponent(t)+'&op=translate','_blank','noopener')};},
+    timer:()=>{showTool('TIMER',`<input id=""timerSecs"" type=""number"" min=""1"" max=""86400"" value=""60""><button class=""btn"" id=""timerStart"">START TIMER</button><button class=""btn"" id=""timerStop"">STOP</button>`);let id=null;$('timerStart').onclick=()=>{clearInterval(id);let s=Math.max(1,Math.min(86400,Number($('timerSecs').value)||60));out('Remaining: '+s+' seconds');id=setInterval(()=>{s--;out(s>0?'Remaining: '+s+' seconds':'Timer finished!');if(s<=0){clearInterval(id);if('speechSynthesis'in window)speechSynthesis.speak(new SpeechSynthesisUtterance('Timer finished'))}},1000)};$('timerStop').onclick=()=>{clearInterval(id);out('Timer stopped.')};},
+    notes:()=>{showTool('NOTES',`<textarea id=""novaNotes"" placeholder=""Write your notes here...""></textarea><button class=""btn"" id=""saveNotes"">SAVE NOTES</button><button class=""btn"" id=""clearNotes"">CLEAR NOTES</button>`);$('novaNotes').value=localStorage.getItem('nova_notes')||'';$('saveNotes').onclick=()=>{localStorage.setItem('nova_notes',$('novaNotes').value);out('Notes saved on this device.')};$('clearNotes').onclick=()=>{localStorage.removeItem('nova_notes');$('novaNotes').value='';out('Notes cleared.')};},
+    calendar:()=>{showTool('CALENDAR','<p>Open your calendar in a new tab.</p><button class=""btn"" id=""openCal"">OPEN GOOGLE CALENDAR</button>');$('openCal').onclick=()=>window.open('https://calendar.google.com','_blank','noopener');},
+    pdf:()=>{showTool('PDF READER','<p>Select a PDF to open it in your browser. The file stays on your device.</p><button class=""btn"" id=""pickPdf"">CHOOSE PDF</button>');$('pickPdf').onclick=()=>$('pdfInput').click();$('pdfInput').onchange=()=>{const f=$('pdfInput').files[0];if(f)window.open(URL.createObjectURL(f),'_blank','noopener')};},
+    code:()=>{showTool('CODE ASSISTANT','<p>Describe your coding task in the main NOVA chat and press SEND. Your configured Gemini model will answer.</p><button class=""btn"" id=""askCode"">ASK NOVA ABOUT CODE</button>');$('askCode').onclick=()=>{$('prompt').value='Help me with this coding task: ';$('prompt').focus()};},
+    memory:()=>{$('memoryPanel').classList.add('show');renderMemory();$('memoryPanel').scrollIntoView({behavior:'smooth'});},
+    vision:()=>{$('fileInput').accept='image/*';$('fileInput').click();},
+    camera:()=>{$('camBtn').click();},
+    files:()=>{$('filesBtn').click();},
+    voice:()=>{$('mic').click();},
+    clear:()=>{$('clearBtn').click();}
+  };
+  (tools[name]||(()=>showTool('TOOL','Unavailable.')))();
+}
+
+$('send').onclick=send;$('prompt').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}});
+function tick(){$('clock').textContent=new Date().toLocaleTimeString()}tick();setInterval(tick,1000);
+fetch('/api/health').then(r=>r.json()).then(d=>setStatus(d.configured?'NEURAL LINK READY':'CONFIGURE SERVER API KEY',d.configured?'var(--green)':'#f5d76e')).catch(()=>setStatus('SERVER OFFLINE','var(--red)'));
+if('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('/sw.js').catch(()=>{});
+</script></body></html>"
